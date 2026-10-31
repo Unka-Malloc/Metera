@@ -1,4 +1,4 @@
-# Agent rules for Agent-Statistics
+# Agent rules for Metera
 
 ## Boundary
 
