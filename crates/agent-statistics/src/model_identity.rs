@@ -2,7 +2,7 @@
 //! Raw selectors remain lossless; only stable model evidence classifies history.
 
 use crate::contract::{ModelTokenUsageSummary, UNATTRIBUTED_MODEL, UsageVariant};
-use crate::registry::{RegistrySnapshot, model_display_name};
+use crate::registry::ModelRegistry;
 use crate::variant::{is_placeholder_id as is_unattributed_selector, model_selection};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,7 +82,7 @@ pub type RawModelUsage = BTreeMap<(String, UsageVariant), ModelTokenUsageSummary
 pub fn project_model_usage(
     raw: &RawModelUsage,
     source_agent: Option<&str>,
-    registry: &RegistrySnapshot,
+    registry: &dyn ModelRegistry,
 ) -> BTreeMap<String, Value> {
     let mut models = BTreeMap::<String, ModelProjection>::new();
     for ((raw_model, observed_variant), usage) in raw {
@@ -97,8 +97,21 @@ pub fn project_model_usage(
             // A literal placeholder cannot establish which concrete model a
             // floating route selected, even if a catalog short name matches.
             .filter(|model| !placeholder || model.id == selection.id);
+        let is_canonical = resolved.is_some();
+        // Only a unique registry match admits model suffixes as execution
+        // variants. Unknown `research-high` remains a separate model.
+        let (stem, candidate_variant) = terminal_variant(&selection.id);
+        let suffix_variant = if resolved.as_ref().is_some_and(|model| {
+            registry
+                .resolve_historical(&stem, selection.provider_id.as_deref(), source_agent)
+                .is_some_and(|base| base.id == model.id)
+        }) {
+            candidate_variant
+        } else {
+            UsageVariant::default()
+        };
         let (id, display_name) = match resolved {
-            Some(model) => (model.id.clone(), model.display_name.clone()),
+            Some(model) => (model.id, model.display_name),
             None if is_unattributed_selector(&selection.id)
                 || (selection.provider_id.is_none()
                     && (registry.is_provider_label(&selection.id)
@@ -109,27 +122,15 @@ pub fn project_model_usage(
             }
             None => (
                 selection.unresolved_identity(),
-                model_display_name(&selection.id),
+                registry.display_name(&selection.id),
             ),
-        };
-        // Only a unique registry match admits model suffixes as execution
-        // variants. Unknown `research-high` remains a separate model.
-        let (stem, candidate_variant) = terminal_variant(&selection.id);
-        let suffix_variant = if resolved.is_some_and(|model| {
-            registry
-                .resolve_historical(&stem, selection.provider_id.as_deref(), source_agent)
-                .is_some_and(|base| base.id == model.id)
-        }) {
-            candidate_variant
-        } else {
-            UsageVariant::default()
         };
         let variant = observed_variant
             .with_fallback(&selection.variant)
             .with_fallback(&suffix_variant);
         let model = models.entry(id).or_default();
         model.display_name = display_name;
-        model.is_canonical |= resolved.is_some();
+        model.is_canonical |= is_canonical;
         model.total.merge(*usage);
         if let Some(label) = variant.label() {
             model.variants.entry(label).or_default().merge(*usage);
@@ -229,7 +230,7 @@ pub fn raw_usage_json(raw: &RawModelUsage) -> Value {
     )
 }
 
-pub fn normalize_retained_report(report: &mut Value, registry: &RegistrySnapshot) {
+pub fn normalize_retained_report(report: &mut Value, registry: &dyn ModelRegistry) {
     let preserve_attribution = report
         .get("modelRegistryRevision")
         .and_then(Value::as_str)
@@ -266,7 +267,7 @@ pub fn normalize_retained_report(report: &mut Value, registry: &RegistrySnapshot
 fn normalize_bucket(
     bucket: &mut Value,
     source_agent: Option<&str>,
-    registry: &RegistrySnapshot,
+    registry: &dyn ModelRegistry,
     preserve_attribution: bool,
 ) {
     let raw = raw_model_usage(bucket);
@@ -295,7 +296,7 @@ fn preserve_published_models(
     bucket: &Value,
     raw: &RawModelUsage,
     source_agent: Option<&str>,
-    registry: &RegistrySnapshot,
+    registry: &dyn ModelRegistry,
 ) -> Option<BTreeMap<String, Value>> {
     let existing = bucket.get("modelTokenUsage")?.as_object()?;
     if existing.is_empty() {
@@ -304,21 +305,25 @@ fn preserve_published_models(
     let has_raw = bucket.get("rawModelUsage").is_some();
     let corrected_ids = existing
         .keys()
-        .filter_map(|id| registry.canonical_model(id).filter(|model| model.id != *id))
-        .map(|model| model.id.as_str())
+        .filter_map(|id| {
+            registry
+                .canonical_model(id)
+                .filter(|model| model.id != *id)
+                .map(|model| model.id)
+        })
         .collect::<BTreeSet<_>>();
-    let mut corrected_totals = BTreeMap::<&str, ModelTokenUsageSummary>::new();
+    let mut corrected_totals = BTreeMap::<String, ModelTokenUsageSummary>::new();
     for (id, value) in existing {
         if let Some(model) = registry.canonical_model(id)
-            && corrected_ids.contains(model.id.as_str())
+            && corrected_ids.contains(&model.id)
         {
             corrected_totals
-                .entry(model.id.as_str())
+                .entry(model.id)
                 .or_default()
                 .merge(ModelTokenUsageSummary::from_json(value));
         }
     }
-    let mut corrected_raw = BTreeMap::<&str, RawModelUsage>::new();
+    let mut corrected_raw = BTreeMap::<String, RawModelUsage>::new();
     let mut raw_by_identity = BTreeMap::<String, RawModelUsage>::new();
     let mut observed_identities = BTreeSet::new();
     for (key, usage) in raw {
@@ -329,10 +334,10 @@ fn preserve_published_models(
                 selection.provider_id.as_deref(),
                 source_agent,
             )
-            && corrected_ids.contains(model.id.as_str())
+            && corrected_ids.contains(&model.id)
         {
             corrected_raw
-                .entry(model.id.as_str())
+                .entry(model.id)
                 .or_default()
                 .insert(key.clone(), *usage);
         }
@@ -358,7 +363,7 @@ fn preserve_published_models(
         for usage in selected.values() {
             total.merge(*usage);
         }
-        if corrected_totals.get(id) == Some(&total) {
+        if corrected_totals.get(&id) == Some(&total) {
             for (id, value) in project_model_usage(&selected, source_agent, registry) {
                 models.insert(id, ModelProjection::from_published(&value));
             }
@@ -368,7 +373,10 @@ fn preserve_published_models(
     for (id, value) in existing {
         let selection = model_selection(id);
         let current = registry.canonical_model(id);
-        if current.is_some_and(|model| reprojected_ids.contains(&model.id)) {
+        if current
+            .as_ref()
+            .is_some_and(|model| reprojected_ids.contains(&model.id))
+        {
             continue;
         }
         let is_model_id =
@@ -384,16 +392,19 @@ fn preserve_published_models(
                 .unwrap_or_else(|| {
                     current.is_some() || (has_raw && !observed_identities.contains(id))
                 });
-        if (canonical && current.is_none_or(|model| model.id == *id)) || id == UNATTRIBUTED_MODEL {
+        if (canonical && current.as_ref().is_none_or(|model| model.id == *id))
+            || id == UNATTRIBUTED_MODEL
+        {
             let mut model = ModelProjection::from_published(value);
             model.is_canonical = canonical;
             model.display_name = current
+                .as_ref()
                 .map(|model| model.display_name.clone())
                 .unwrap_or_else(|| {
                     if model.display_name.is_empty() {
-                        model_display_name(id)
+                        registry.display_name(id)
                     } else {
-                        model_display_name(&model.display_name)
+                        registry.display_name(&model.display_name)
                     }
                 });
             models.entry(id.clone()).or_default().merge(model);
@@ -427,8 +438,10 @@ fn preserve_published_models(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn catalog() -> RegistrySnapshot {
-        RegistrySnapshot::from_catalog(json!({
+    use crate::registry::{TestRegistry, model_display_name};
+
+    fn catalog() -> TestRegistry {
+        TestRegistry::from_catalog(json!({
             "models": {
                 "moonshotai/kimi-k3":{"name":"Kimi K3"},
                 "moonshotai/kimi-k2.7-code":{"name":"Kimi K2.7 Code"},
@@ -477,7 +490,7 @@ mod tests {
         .map(|(model, variant, total)| ((model.to_owned(), variant), count(total)))
         .collect();
         for agent in ["cursor", "opencode", "codex"] {
-            let models = project_model_usage(&raw, Some(agent), &RegistrySnapshot::empty());
+            let models = project_model_usage(&raw, Some(agent), &TestRegistry::empty());
             assert_eq!(models.len(), 1);
             let model = &models["cursor/composer-2.5"];
             assert_eq!(model["displayName"], "Composer 2.5");
@@ -539,7 +552,7 @@ mod tests {
                 "dailyUsage":[bucket]
             }
         }]});
-        normalize_retained_report(&mut report, &RegistrySnapshot::empty());
+        normalize_retained_report(&mut report, &TestRegistry::empty());
         let history = &report["agents"][0]["history"];
         let mut expected = standard;
         expected.merge(fast);
@@ -558,7 +571,7 @@ mod tests {
             );
         }
         let normalized = report.clone();
-        normalize_retained_report(&mut report, &RegistrySnapshot::empty());
+        normalize_retained_report(&mut report, &TestRegistry::empty());
         assert_eq!(report, normalized);
 
         // An old canonical Fast label must not override a retained request's
@@ -567,7 +580,7 @@ mod tests {
             "agentId":"cursor", "history":bucket
         }]});
         report["agents"][0]["history"]["rawModelUsage"][1]["fast"] = json!(false);
-        normalize_retained_report(&mut report, &RegistrySnapshot::empty());
+        normalize_retained_report(&mut report, &TestRegistry::empty());
         let model = &report["agents"][0]["history"]["modelTokenUsage"]["cursor/composer-2.5"];
         assert_eq!(ModelTokenUsageSummary::from_json(model), expected);
         assert!(model["variants"].as_object().unwrap().is_empty());
@@ -690,7 +703,7 @@ mod tests {
         );
         assert_eq!(models["research-high"]["totalTokens"], 30);
 
-        let registry = RegistrySnapshot::from_catalog(json!({
+        let registry = TestRegistry::from_catalog(json!({
             "models":{"lab/default":{"name":"Named Model"}},
             "providers":{"relay":{"models":{"default":{"base_model":"lab/default"}}}}
         }))
@@ -727,7 +740,7 @@ mod tests {
 
     #[test]
     fn complete_selectors_resolve_but_damaged_projection_keys_never_pin_an_identity() {
-        let registry = RegistrySnapshot::from_catalog(json!({"models":{
+        let registry = TestRegistry::from_catalog(json!({"models":{
             "anthropic/claude-opus-4.6":{"name":"Claude Opus 4.6"},
             "anthropic/claude-opus-4.7":{"name":"Claude Opus 4.7"}
         },"providers":{}}))
@@ -834,7 +847,7 @@ mod tests {
 
     #[test]
     fn opaque_provider_selectors_keep_slash_ids_without_guessing_historical_routes() {
-        let registry = RegistrySnapshot::from_catalog(json!({
+        let registry = TestRegistry::from_catalog(json!({
             "models": {
                 "lab/model-1":{"name":"First Model"},
                 "lab/model-2":{"name":"Second Model"}
@@ -881,13 +894,8 @@ mod tests {
         );
         assert!(!models.contains_key("lab/model-1"));
         assert!(!models.contains_key("lab/model-2"));
-        assert_eq!(
-            registry
-                .resolve_with_provider("lab/flash-latest", Some("relay-a"), Some("opencode"))
-                .unwrap()
-                .id,
-            "lab/model-1"
-        );
+        assert!(registry.is_provider_label("relay-a"));
+        assert!(registry.is_provider_label("relay-b"));
         assert_eq!(models["relay-a/private/custom-model-v2"]["totalTokens"], 30);
         assert_eq!(models["relay-b/private/custom-model-v2"]["totalTokens"], 40);
         assert_eq!(
@@ -921,7 +929,7 @@ mod tests {
                 if keep_original_model {
                     catalog["models"]["lab/model-v1"] = json!({"name":"First Model Refreshed"});
                 }
-                let registry = RegistrySnapshot::from_catalog(catalog).unwrap();
+                let registry = TestRegistry::from_catalog(catalog).unwrap();
                 let selector = json!({"id":"private-slot","providerID":"relay"}).to_string();
                 let raw = BTreeMap::from([
                     (

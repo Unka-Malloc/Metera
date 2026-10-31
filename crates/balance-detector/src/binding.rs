@@ -14,8 +14,9 @@
 //! keeps one account's balance from being written onto another's ledger when
 //! an adapter reuses a response shape.
 
-use licoup_extension_contracts::{ApplicationFailure, is_namespaced};
 use serde_json::Value;
+use token_usage_detector::UsageFailure;
+use token_usage_detector::names::is_namespaced;
 
 use crate::fact::{BalanceFact, MAX_FACTS_PER_READ};
 use crate::refusal;
@@ -61,7 +62,7 @@ impl AccountBinding {
         provider_ref: impl Into<String>,
         account_ref: impl Into<String>,
         account_epoch: impl Into<String>,
-    ) -> Result<Self, ApplicationFailure> {
+    ) -> Result<Self, UsageFailure> {
         let binding = Self {
             provider_ref: provider_ref.into(),
             account_ref: account_ref.into(),
@@ -71,7 +72,7 @@ impl AccountBinding {
         Ok(binding)
     }
 
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         if !is_namespaced(&self.provider_ref) {
             return Err(refusal("balance_binding_invalid").with_field("providerRef"));
         }
@@ -97,7 +98,7 @@ impl AccountBinding {
         &self,
         facts: Vec<BalanceFact>,
         observed_at: impl Into<String>,
-    ) -> Result<BoundBalance, ApplicationFailure> {
+    ) -> Result<BoundBalance, UsageFailure> {
         let read = BoundBalance {
             binding: self.clone(),
             observed_at: observed_at.into(),
@@ -119,7 +120,7 @@ pub struct BoundBalance {
 }
 
 impl BoundBalance {
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         self.binding.validate()?;
         if self.observed_at.is_empty() {
             return Err(refusal("balance_read_invalid").with_field("observedAt"));

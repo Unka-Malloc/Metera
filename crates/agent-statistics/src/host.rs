@@ -6,12 +6,15 @@
 //! decisions the embedding host answers once at process start.
 
 use crate::contract::{AgentDef, HistoryUsageSummary};
+#[cfg(test)]
+use crate::registry::EmptyModelRegistry;
+use crate::registry::ModelRegistry;
 use crate::window::UsageWindow;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// The host answers. `summarize_agent_history` returns one agent's usage
 /// summary; returning `Err` reports the agent as skipped rather than failing
@@ -23,8 +26,7 @@ pub struct StatisticsHost {
     pub summarize_agent_history:
         fn(&AgentDef, &Value, &UsageWindow, &mut Vec<Value>) -> Result<HistoryUsageSummary>,
     pub target_status: fn(&Value, &mut Vec<Value>) -> BTreeMap<String, String>,
-    pub model_registry_snapshot:
-        fn(Option<&Path>) -> std::sync::Arc<licoup_model_catalog::identity::RegistrySnapshot>,
+    pub model_registry_snapshot: fn(Option<&Path>) -> Arc<dyn ModelRegistry>,
 }
 
 static HOST: OnceLock<StatisticsHost> = OnceLock::new();
@@ -105,6 +107,6 @@ pub(crate) fn install_test_host() {
             })
         },
         target_status: |_, _| BTreeMap::new(),
-        model_registry_snapshot: |_| licoup_model_catalog::identity::snapshot(),
+        model_registry_snapshot: |_| Arc::new(EmptyModelRegistry),
     });
 }

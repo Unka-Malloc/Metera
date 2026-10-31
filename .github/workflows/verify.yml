@@ -21,3 +21,17 @@ jobs:
         with:
           toolchain: stable
       - run: ./scripts/verify.sh
+
+  # The detector publishes a lower MSRV than the workspace toolchain: it is
+  # built and tested alone on its declared floor so the embeddable SDK's
+  # floor cannot silently drift up with workspace-only features.
+  msrv-detector:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.85"
+      - run: cargo test -p token-usage-detector --locked

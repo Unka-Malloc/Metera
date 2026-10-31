@@ -31,17 +31,23 @@
 //! producer counted requests without tokens settles as `unknown` with no
 //! number, because a zero would be a claim that nothing happened.
 //!
-//! Retention is durable, not time-windowed. A fact's identity is derived from
-//! what it measures (`scope#identity#metric`), so a day-model reading that a
-//! later scan reports again updates its row in place — the store grows with
-//! distinct measurements, never with redeliveries. The purge path is the same
-//! one settlement uses: a consumer withdraws what it owns through
-//! [`MeteringFactPort::retract`], and an event's facts leave when the event's
-//! revision retracts them. The retained-report collection that projects these
-//! facts carries its own byte-and-count retention in `persistence`, and the
-//! gateway counters carry theirs (`MAX_DAYS`, a rolling window enforced on
-//! every record) — the ledger is the source of truth those bounded views read,
-//! so it keeps history rather than expiring it.
+//! Retention is bounded, not append-only. Rows older than
+//! `USAGE_JOURNAL_RETENTION_MS` are purged when the journal opens — a hard
+//! deletion, because the journal is a current-state record: a producer that
+//! still holds a reading settles it again on its next scan or delivery, and
+//! a retracted or expired row stops costing the store it left. Inside the
+//! horizon a fact's identity is derived from what it measures
+//! (`scope#identity#metric`), so a day-model reading that a later scan
+//! reports again updates its row in place — the store grows with distinct
+//! measurements, never with redeliveries. The in-window purge path is the
+//! same one settlement uses: a consumer withdraws what it owns through
+//! [`MeteringFactPort::retract`], and an event's facts leave when the
+//! event's revision retracts them. The retained-report collection that
+//! projects these facts carries its own byte-and-count retention in
+//! `persistence`, the gateway counters carry theirs (`MAX_DAYS`, a rolling
+//! window enforced on every record), and a scrape folds the retained facts
+//! through a capped, explicitly truncating scan in `export` — the ledger
+//! stays the bounded source of truth those views read.
 
 use crate::contract::HistoryUsageSummary;
 use crate::journal::{
@@ -53,7 +59,6 @@ use crate::persistence::client_state_store;
 use acativa::usage_ledger::{
     LedgerError, LedgerResult, WORKFLOW_LEDGER_FILE_NAME, WORKFLOW_LEDGER_SCHEMA_VERSION,
 };
-use licoup_extension_contracts::usage::Quality;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -61,6 +66,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use token_usage_detector::binding::{BoundObservation, SourceBinding};
 use token_usage_detector::collection::{PublishBatch, QueryPage, QueryRequest};
 use token_usage_detector::metrics as general;
+use token_usage_detector::usage::Quality;
 
 /// The journal generation these facts belong to, as the report names it.
 pub const USAGE_JOURNAL_SCHEMA: &str = "usage-journal.v1";
@@ -444,10 +450,6 @@ pub fn held_metering(params: &Value) -> LedgerResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use licoup_extension_contracts::usage::{
-        MetricValue, Temporality, UsageObservation, UsageOperation,
-    };
-    use licoup_extension_contracts::wire;
     use rusqlite::Connection;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -455,6 +457,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use token_usage_detector::collection::Cursor;
+    use token_usage_detector::usage::wire;
+    use token_usage_detector::usage::{MetricValue, Temporality, UsageObservation, UsageOperation};
 
     const SOURCE: &str = "source:example.analytics#1";
     const EXTENSION: &str = "example.analytics";

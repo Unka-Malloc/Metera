@@ -21,10 +21,11 @@
 //! [`SourceBinding`], so a normalized record cannot bypass the transport-bound
 //! epoch or the authorized scope.
 
-use licoup_extension_contracts::usage::{
+use crate::failure::UsageFailure;
+use crate::names::is_namespaced;
+use crate::usage::{
     CostObservation, MetricValue, Quality, Temporality, UsageObservation, UsageOperation,
 };
-use licoup_extension_contracts::{ApplicationFailure, is_namespaced};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -137,7 +138,7 @@ impl FieldMapping {
         record: &Value,
         binding: &SourceBinding,
         measurement_ref: Option<&str>,
-    ) -> Result<Option<BoundObservation>, ApplicationFailure> {
+    ) -> Result<Option<BoundObservation>, UsageFailure> {
         let operation =
             match self.optional_string(record, self.operation.as_deref(), "operation")? {
                 Some("retract") => UsageOperation::Retract,
@@ -294,7 +295,7 @@ impl FieldMapping {
             return Ok(None);
         }
         let observation = UsageObservation {
-            schema: licoup_extension_contracts::wire::USAGE.to_owned(),
+            schema: crate::usage::wire::USAGE.to_owned(),
             observation_id,
             revision,
             operation,
@@ -319,7 +320,7 @@ impl FieldMapping {
         record: &Value,
         path: &str,
         field: &str,
-    ) -> Result<Option<String>, ApplicationFailure> {
+    ) -> Result<Option<String>, UsageFailure> {
         match read_path(record, path)
             .map_err(|_| refusal("usage_mapping_invalid").with_field(field))?
         {
@@ -334,7 +335,7 @@ impl FieldMapping {
         record: &'a Value,
         path: Option<&str>,
         field: &str,
-    ) -> Result<Option<&'a str>, ApplicationFailure> {
+    ) -> Result<Option<&'a str>, UsageFailure> {
         let Some(path) = path else {
             return Ok(None);
         };
@@ -445,7 +446,7 @@ impl OtlpSumNormalizer {
     pub fn new(
         metric_namespace: impl Into<String>,
         quality: Quality,
-    ) -> Result<Self, ApplicationFailure> {
+    ) -> Result<Self, UsageFailure> {
         let normalizer = Self {
             metric_namespace: metric_namespace.into(),
             quality,
@@ -467,7 +468,7 @@ impl OtlpSumNormalizer {
         &self,
         record: &Value,
         binding: &SourceBinding,
-    ) -> Result<Vec<BoundObservation>, ApplicationFailure> {
+    ) -> Result<Vec<BoundObservation>, UsageFailure> {
         let name = record
             .get("name")
             .and_then(Value::as_str)
@@ -536,7 +537,7 @@ impl OtlpSumNormalizer {
                 return Err(refusal("usage_mapping_invalid").with_field("observationId"));
             }
             let observation = UsageObservation {
-                schema: licoup_extension_contracts::wire::USAGE.to_owned(),
+                schema: crate::usage::wire::USAGE.to_owned(),
                 observation_id,
                 revision: 1,
                 operation: UsageOperation::Upsert,

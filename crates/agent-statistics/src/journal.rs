@@ -31,23 +31,62 @@
 //! measurement settles into one fact instead of one per source.
 
 use acativa::usage_ledger::{Ledger, LedgerError, LedgerResult, now_ms, open_ledger};
-use licoup_extension_contracts::usage::{ExactNumber, Quality, UsageObservation, UsageOperation};
-use licoup_extension_contracts::{ApplicationFailure, is_namespaced};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::fmt::Write as _;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use token_usage_detector::UsageFailure;
 use token_usage_detector::binding::{
     BatchRefusal, BoundObservation, BoundObservationKey, SourceBinding,
 };
 use token_usage_detector::collection::{Cursor, PublishBatch, QueryPage, QueryRequest};
 use token_usage_detector::metrics as general;
+use token_usage_detector::names::is_namespaced;
+use token_usage_detector::usage::{ExactNumber, Quality, UsageObservation, UsageOperation};
 
 /// The stage every refusal from this journal reports.
 const STAGE: &str = "usage-journal";
 
 /// The most facts one read returns.
 pub const MAX_FACT_PAGE: usize = 500;
+
+/// How long a retained journal row may live: 400 days — well past the
+/// longest report window a consumer may declare, so no legitimate
+/// projection outlives the store it reads. The journal is a bounded
+/// current-state record, not an append history: every row — live event,
+/// fact or cursor — is purged at the horizon, and a retraction tombstone
+/// only outlives it by the [`MAX_OBSERVED_AHEAD_MS`] skew grace, the
+/// longest its withdrawn observation can stay admissible. Reads
+/// apply the same bound at query time, so nothing past the horizon is
+/// ever served; physical deletion runs at open and on the first read or
+/// write entry after [`SWEEP_INTERVAL_MS`] elapses — the longest a row can
+/// linger on disk in a journal that is used at all is one sweep interval
+/// past its expiry. A journal no one calls performs no I/O and serves
+/// nothing until it is used again. Dedup semantics — revision order,
+/// retraction, replay idempotence — hold inside the window; past it, a
+/// stale redelivery still cannot resurrect a withdrawn observation: it
+/// carries the observation's original `observed_at`, which is itself
+/// past the horizon by then and refused at admission. What no bound can
+/// distinguish is a source re-dating an old observation as new — that is
+/// a fresh claim, not a replay.
+/// Retained local-history horizon — an immutable local-data bound, not an
+/// operator setting.
+pub const USAGE_JOURNAL_RETENTION_MS: i64 = 400 * 24 * 60 * 60 * 1_000;
+
+/// How often a held-open journal re-runs its retention sweep — an
+/// immutable cadence, not an operator setting: once an hour at most —
+/// expired rows linger at most this long past the horizon, and a busy
+/// write path never pays a sweep per call.
+const SWEEP_INTERVAL_MS: i64 = 60 * 60 * 1_000;
+
+/// How far ahead of the journal's clock a measurement may claim to be:
+/// 24 hours of clock-skew grace. A timestamp claimed further into the
+/// future would stay "fresh" longer than any retraction tombstone lives,
+/// so a redelivery of it could resurrect a withdrawn observation once
+/// the tombstone itself is purged.
+const MAX_OBSERVED_AHEAD_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// The metric an unsettled obligation is reported under: the general total the
 /// SDK publishes, because an obligation is about tokens until it is settled.
@@ -420,6 +459,12 @@ const USAGE_JOURNAL_INIT: &str = "CREATE TABLE IF NOT EXISTS usage_source_events
              ON usage_source_facts(scope_ref,metric,fact_id);
            CREATE INDEX IF NOT EXISTS usage_source_facts_event
              ON usage_source_facts(source_ref,source_epoch,observation_id);
+           -- The retention sweep's delete predicates are indexed, so an open
+           -- never scans the retained rows it keeps.
+           CREATE INDEX IF NOT EXISTS usage_source_facts_retention
+             ON usage_source_facts(updated_at_ms);
+           CREATE INDEX IF NOT EXISTS usage_source_events_retention
+             ON usage_source_events(settled_at_ms);
            CREATE TABLE IF NOT EXISTS usage_source_cursors (
              source_ref TEXT NOT NULL,
              source_epoch TEXT NOT NULL,
@@ -428,11 +473,17 @@ const USAGE_JOURNAL_INIT: &str = "CREATE TABLE IF NOT EXISTS usage_source_events
              cursor TEXT NOT NULL,
              updated_at_ms INTEGER NOT NULL,
              PRIMARY KEY(source_ref,source_epoch)
-           );";
+           );
+           CREATE INDEX IF NOT EXISTS usage_source_cursors_retention
+             ON usage_source_cursors(updated_at_ms);";
 
 /// The base usage journal, in the kernel's ledger store.
 pub struct UsageJournal {
     ledger: Ledger,
+    /// The last retention sweep's timestamp: a long-lived journal sweeps
+    /// again only after [`SWEEP_INTERVAL_MS`] has elapsed. Interior because
+    /// read paths sweep too, and they borrow the journal immutably.
+    last_sweep_ms: Cell<i64>,
 }
 
 impl UsageJournal {
@@ -443,7 +494,65 @@ impl UsageJournal {
             .connection
             .execute_batch(USAGE_JOURNAL_INIT)
             .map_err(|_| LedgerError::storage())?;
-        Ok(Self { ledger })
+        let now = now_ms();
+        let journal = Self {
+            ledger,
+            last_sweep_ms: Cell::new(now),
+        };
+        journal.sweep_retention(now)?;
+        Ok(journal)
+    }
+
+    /// Run the retention sweep when the interval has elapsed: a journal
+    /// held open for weeks still expires its rows, while a busy path never
+    /// pays a sweep per call. Every entry — read or write — sweeps before
+    /// its own work so nothing commits or is served over a broken store.
+    fn maybe_sweep_retention(&self) -> LedgerResult<()> {
+        let now = now_ms();
+        if now - self.last_sweep_ms.get() < SWEEP_INTERVAL_MS {
+            return Ok(());
+        }
+        self.sweep_retention(now)?;
+        self.last_sweep_ms.set(now);
+        Ok(())
+    }
+
+    /// Drop retained rows older than the retention horizon. Facts, live
+    /// events and cursors share the ordinary bound; a retracted event's
+    /// dedup tombstone outlives it by the accepted clock-skew grace — the
+    /// observation it withdraws may carry an `observed_at` up to
+    /// `MAX_OBSERVED_AHEAD_MS` past its settlement, so the tombstone must
+    /// guard until that original can no longer be admitted. Past the
+    /// extended window an honest redelivery is refused at admission on its
+    /// own stale timestamp, and the bound still keeps source churn from
+    /// growing the store without limit.
+    fn sweep_retention(&self, now_ms: i64) -> LedgerResult<()> {
+        let cutoff = now_ms - USAGE_JOURNAL_RETENTION_MS;
+        let tombstone_cutoff = cutoff - MAX_OBSERVED_AHEAD_MS;
+        for (statement, bound) in [
+            (
+                "DELETE FROM usage_source_facts WHERE updated_at_ms<?1",
+                cutoff,
+            ),
+            (
+                "DELETE FROM usage_source_events WHERE retracted=0 AND settled_at_ms<?1",
+                cutoff,
+            ),
+            (
+                "DELETE FROM usage_source_events WHERE retracted=1 AND settled_at_ms<?1",
+                tombstone_cutoff,
+            ),
+            (
+                "DELETE FROM usage_source_cursors WHERE updated_at_ms<?1",
+                cutoff,
+            ),
+        ] {
+            self.ledger
+                .connection
+                .execute(statement, params![bound])
+                .map_err(|_| LedgerError::storage())?;
+        }
+        Ok(())
     }
 
     /// The exact total of one scope and metric over the facts that may settle.
@@ -452,17 +561,20 @@ impl UsageJournal {
     /// zero, and reporting one would turn "nobody knows" into "nothing was
     /// used".
     pub fn settled_total(&self, scope_ref: &str, metric: &str) -> LedgerResult<Option<String>> {
+        self.maybe_sweep_retention()?;
+        let cutoff = now_ms() - USAGE_JOURNAL_RETENTION_MS;
         let mut total: Option<ExactNumber> = None;
         let mut statement = self
             .ledger
             .connection
             .prepare(
                 "SELECT value,eligibility FROM usage_source_facts
-                 WHERE scope_ref=?1 AND metric=?2 AND retracted=0",
+                 WHERE scope_ref=?1 AND metric=?2 AND retracted=0
+                   AND updated_at_ms>=?3",
             )
             .map_err(|_| LedgerError::storage())?;
         let rows = statement
-            .query_map(params![scope_ref, metric], |row| {
+            .query_map(params![scope_ref, metric, cutoff], |row| {
                 Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|_| LedgerError::storage())?;
@@ -490,6 +602,7 @@ impl UsageSourcePort for UsageJournal {
         admission: &SourceAdmission,
         batch: &PublishBatch,
     ) -> LedgerResult<IngestReport> {
+        self.maybe_sweep_retention()?;
         // Bind each payload under its own batch position: the refused index a
         // producer reads back must point at its record, not at a slot in a
         // filtered list.
@@ -542,6 +655,7 @@ impl UsageSourcePort for UsageJournal {
         admission: &SourceAdmission,
         bound: &BoundObservation,
     ) -> LedgerResult<EventSettlement> {
+        self.maybe_sweep_retention()?;
         require_admitted(admission, bound)?;
         let transaction = self
             .ledger
@@ -559,6 +673,7 @@ impl UsageSourcePort for UsageJournal {
         scope_ref: &str,
         limit: Option<u32>,
     ) -> LedgerResult<QueryRequest> {
+        self.maybe_sweep_retention()?;
         if !admission.binding.authorizes_scope(scope_ref) {
             return Err(LedgerError::refused(
                 STAGE,
@@ -590,6 +705,7 @@ impl UsageSourcePort for UsageJournal {
         request: &QueryRequest,
         page: &QueryPage,
     ) -> LedgerResult<IngestReport> {
+        self.maybe_sweep_retention()?;
         page.validate().map_err(from_refusal)?;
         page.check_request(request).map_err(from_refusal)?;
         if page.source_epoch != admission.binding.source_epoch {
@@ -696,6 +812,7 @@ impl UsageSourcePort for UsageJournal {
     }
 
     fn durable_cursor(&self, binding: &SourceBinding) -> LedgerResult<Option<String>> {
+        self.maybe_sweep_retention()?;
         stored_cursor(
             &self.ledger.connection,
             &binding.source_ref,
@@ -728,6 +845,7 @@ impl MeteringFactPort for UsageJournal {
         owner: &str,
         facts: Vec<MeteringFact>,
     ) -> LedgerResult<Vec<FactReceipt>> {
+        self.maybe_sweep_retention()?;
         require_owner(owner)?;
         for fact in &facts {
             fact.validate()?;
@@ -752,6 +870,7 @@ impl MeteringFactPort for UsageJournal {
     }
 
     fn retract(&mut self, owner: &str, fact_id: &str) -> LedgerResult<FactReceipt> {
+        self.maybe_sweep_retention()?;
         require_owner(owner)?;
         let transaction = self
             .ledger
@@ -786,10 +905,12 @@ impl MeteringFactPort for UsageJournal {
     }
 
     fn read(&self, cursor: Option<&str>, limit: usize) -> LedgerResult<FactPage> {
+        self.maybe_sweep_retention()?;
         if limit == 0 {
             return Ok(FactPage::empty());
         }
         let limit = limit.min(MAX_FACT_PAGE);
+        let cutoff = now_ms() - USAGE_JOURNAL_RETENTION_MS;
         let mut statement = self
             .ledger
             .connection
@@ -797,13 +918,14 @@ impl MeteringFactPort for UsageJournal {
                 "SELECT fact_id,scope_ref,metric,value,unit,quality,eligibility,
                         source_ref,observed_at
                  FROM usage_source_facts
-                 WHERE retracted=0 AND (?1 IS NULL OR fact_id>?1)
+                 WHERE retracted=0 AND updated_at_ms>=?3
+                   AND (?1 IS NULL OR fact_id>?1)
                  ORDER BY fact_id LIMIT ?2",
             )
             .map_err(|_| LedgerError::storage())?;
         let rows = statement
             .query_map(
-                params![cursor, sqlite_counter((limit + 1) as u64)?],
+                params![cursor, sqlite_counter((limit + 1) as u64)?, cutoff],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -845,6 +967,7 @@ impl MeteringFactPort for UsageJournal {
     }
 
     fn pending(&self) -> LedgerResult<Vec<PendingObligation>> {
+        self.maybe_sweep_retention()?;
         // The journal reports what the shared store still holds unsettled. The
         // reservation rows belong to the Graph ledger (`acativa::usage_ledger`)
         // — this read goes through that owner's API rather than naming its
@@ -890,6 +1013,32 @@ fn settle_event(
     bound: &BoundObservation,
 ) -> LedgerResult<EventSettlement> {
     let key = bound.key();
+    // An upsert measured before the retention horizon can no longer settle:
+    // its dedup record may already be swept, so accepting it would either
+    // resurrect usage that already expired or write a fact whose age is
+    // past the bound. An unreadable timestamp proves no freshness either,
+    // and a timestamp claimed beyond the skew grace would stay "fresh"
+    // longer than any tombstone lives. A retraction carries nothing to
+    // resurrect and still resolves against the recorded event — or to
+    // unknown once that record is gone.
+    if bound.observation.operation == UsageOperation::Upsert {
+        let observed_at_ms = OffsetDateTime::parse(&bound.observation.observed_at, &Rfc3339)
+            .map(|at| at.unix_timestamp().saturating_mul(1_000))
+            .unwrap_or(i64::MIN);
+        let now = now_ms();
+        if observed_at_ms < now - USAGE_JOURNAL_RETENTION_MS {
+            return Err(LedgerError::refused(
+                STAGE,
+                "usage_journal_observation_expired",
+            ));
+        }
+        if observed_at_ms > now + MAX_OBSERVED_AHEAD_MS {
+            return Err(LedgerError::refused(
+                STAGE,
+                "usage_journal_observation_ahead",
+            ));
+        }
+    }
     let stored: Option<StoredEvent> = transaction
         .query_row(
             "SELECT revision,content_digest,measurement_ref,retracted
@@ -1014,10 +1163,19 @@ fn settle_event(
                 if stored.content_digest != incoming_digest {
                     return Err(LedgerError::refused(STAGE, "usage_journal_event_conflict"));
                 }
-                return Ok(settlement(
-                    EventOutcome::Replayed,
-                    receipts(FactOutcome::Unchanged),
-                ));
+                // A replay writes nothing new — except what expiry already
+                // swept: each fact reports its own outcome, so a rescan
+                // repopulates a row the retention pass removed while the
+                // dedup record still stood.
+                let mut replayed = Vec::with_capacity(facts.len());
+                for fact in &facts {
+                    let outcome = write_fact(transaction, fact, Some(&owner))?;
+                    replayed.push(FactReceipt {
+                        fact_id: fact.fact_id.clone(),
+                        outcome,
+                    });
+                }
+                return Ok(settlement(EventOutcome::Replayed, replayed));
             }
             transaction
                 .execute(
@@ -1440,11 +1598,14 @@ fn stored_cursor(
     source_ref: &str,
     source_epoch: &str,
 ) -> LedgerResult<Option<StoredCursor>> {
+    // The cutoff is enforced on the read, not only by the hourly sweep: an
+    // expired cursor is absent whether or not its row has been swept yet.
+    let cutoff = now_ms() - USAGE_JOURNAL_RETENTION_MS;
     connection
         .query_row(
             "SELECT scope_ref,cursor,sequence FROM usage_source_cursors
-             WHERE source_ref=?1 AND source_epoch=?2",
-            params![source_ref, source_epoch],
+             WHERE source_ref=?1 AND source_epoch=?2 AND updated_at_ms>=?3",
+            params![source_ref, source_epoch, cutoff],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1503,23 +1664,23 @@ fn sqlite_counter(value: u64) -> LedgerResult<i64> {
 
 /// Carry a refusal from the published SDK through the base ledger's error shape
 /// without losing the code the caller reconciles on.
-fn from_refusal(failure: ApplicationFailure) -> LedgerError {
+fn from_refusal(failure: UsageFailure) -> LedgerError {
     LedgerError {
         code: failure.code,
         stage: failure.stage,
         retryable: failure.retryable,
-        recovery: failure.recovery.mcp_wire().to_owned(),
+        recovery: failure.recovery.wire().to_owned(),
     }
 }
 
 /// Carry a journal refusal into the report's refusal vocabulary, preserving the
 /// code the caller reconciles on. Storage failures never reach this shape —
 /// they abort the batch instead.
-fn failure_from(error: LedgerError) -> ApplicationFailure {
+fn failure_from(error: LedgerError) -> UsageFailure {
     if error.retryable {
-        ApplicationFailure::retryable(error.code, error.stage)
+        UsageFailure::retryable(error.code, error.stage)
     } else {
-        ApplicationFailure::permanent(error.code, error.stage)
+        UsageFailure::permanent(error.code, error.stage)
     }
 }
 
@@ -1527,10 +1688,6 @@ fn failure_from(error: LedgerError) -> ApplicationFailure {
 mod tests {
     use super::*;
     use acativa::usage_ledger::{reserve_graph_command, settle_graph_command};
-    use licoup_extension_contracts::usage::{
-        CostObservation, MetricValue, Temporality, UsageObservation,
-    };
-    use licoup_extension_contracts::wire;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
@@ -1538,6 +1695,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use token_usage_detector::normalize::OtlpSumNormalizer;
+    use token_usage_detector::usage::wire;
+    use token_usage_detector::usage::{
+        CostObservation, MetricValue, Temporality, UsageObservation,
+    };
 
     /// The synthetic OTLP-shaped series the accepted component fixtures publish,
     /// reused here so the base journal is exercised against the same producer
@@ -1580,6 +1741,16 @@ mod tests {
         MetricValue::reported(value, "tokens", Temporality::Delta)
     }
 
+    /// A fixture `observed_at` that stays inside the admission window on any
+    /// clock: an hour behind real time keeps it past the freshness bound and
+    /// well inside the retention horizon whatever year the suite runs in.
+    fn fresh_observed_at() -> String {
+        OffsetDateTime::from_unix_timestamp(now_ms() / 1000 - 3_600)
+            .expect("fixture clock")
+            .format(&Rfc3339)
+            .expect("rfc3339")
+    }
+
     fn upsert(
         observation_id: &str,
         revision: u32,
@@ -1592,7 +1763,7 @@ mod tests {
             operation: UsageOperation::Upsert,
             source_epoch: "epoch-1".to_owned(),
             scope_ref: SCOPE.to_owned(),
-            observed_at: "2026-09-21T00:00:00Z".to_owned(),
+            observed_at: fresh_observed_at(),
             interval_start: None,
             metrics: metrics
                 .into_iter()
@@ -1699,6 +1870,377 @@ mod tests {
             "a replay does not add a second settlement"
         );
         assert_eq!(facts(&journal).len(), 2, "one fact per observation");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rows_older_than_the_retention_horizon_are_purged_at_open() {
+        let root = root("retention");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        let batch = batch(&[metric_upsert("obs-1", 1, "120")]);
+        journal.publish(&admission, &batch).expect("settled");
+        assert_eq!(facts(&journal).len(), 1);
+
+        // Age every retained row past the horizon, then reopen: the sweep at
+        // open purges what the store held too long.
+        let stale = now_ms() - USAGE_JOURNAL_RETENTION_MS - 1;
+        for statement in [
+            "UPDATE usage_source_facts SET updated_at_ms=?1",
+            "UPDATE usage_source_events SET settled_at_ms=?1",
+            "UPDATE usage_source_cursors SET updated_at_ms=?1",
+        ] {
+            journal
+                .ledger
+                .connection
+                .execute(statement, params![stale])
+                .expect("aged");
+        }
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        assert!(
+            facts(&journal).is_empty(),
+            "retention is enforced at open, not read time"
+        );
+
+        // A redelivery settles again as new state — purging is a bound on
+        // history, never a loss the producer cannot replay.
+        journal.publish(&admission, &batch).expect("settled again");
+        assert_eq!(facts(&journal).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_journal_held_open_sweeps_expired_rows_on_its_write_path() {
+        let root = root("sweep-live");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
+            .expect("settled");
+        assert_eq!(facts(&journal).len(), 1);
+
+        // Age the retained rows and the sweep clock without reopening: the
+        // next write entry runs the sweep itself.
+        let stale = now_ms() - USAGE_JOURNAL_RETENTION_MS - 1;
+        for statement in [
+            "UPDATE usage_source_facts SET updated_at_ms=?1",
+            "UPDATE usage_source_events SET settled_at_ms=?1",
+            "UPDATE usage_source_cursors SET updated_at_ms=?1",
+        ] {
+            journal
+                .ledger
+                .connection
+                .execute(statement, params![stale])
+                .expect("aged");
+        }
+        journal.last_sweep_ms.set(now_ms() - SWEEP_INTERVAL_MS - 1);
+        journal
+            .publish(&admission, &batch(&[metric_upsert("obs-2", 1, "5")]))
+            .expect("settled");
+
+        // The expired row is gone while the journal stayed open; the fresh
+        // write survives the same sweep.
+        let remaining = facts(&journal);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].value.as_deref(), Some("5"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_held_open_read_only_journal_enforces_the_horizon() {
+        let root = root("sweep-read");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
+            .expect("settled");
+        assert_eq!(facts(&journal).len(), 1);
+
+        // Age the retained row and the sweep clock, then touch the journal
+        // only through reads: the horizon holds for the served view and the
+        // read itself runs the pending cleanup — no write is required.
+        let stale = now_ms() - USAGE_JOURNAL_RETENTION_MS - 1;
+        for statement in [
+            "UPDATE usage_source_facts SET updated_at_ms=?1",
+            "UPDATE usage_source_events SET settled_at_ms=?1",
+        ] {
+            journal
+                .ledger
+                .connection
+                .execute(statement, params![stale])
+                .expect("aged");
+        }
+        journal.last_sweep_ms.set(now_ms() - SWEEP_INTERVAL_MS - 1);
+        assert!(
+            facts(&journal).is_empty(),
+            "an expired fact is never served"
+        );
+        assert!(
+            journal
+                .settled_total(SCOPE, METRIC)
+                .expect("total")
+                .is_none(),
+            "an expired fact contributes no settlement"
+        );
+
+        let remaining: i64 = journal
+            .ledger
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_source_facts", [], |row| {
+                row.get(0)
+            })
+            .expect("counted");
+        assert_eq!(remaining, 0, "the read path ran the pending sweep");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_withdrawn_observation_stays_withdrawn_after_its_facts_expire() {
+        let root = root("tombstone");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
+            .expect("settled");
+        journal
+            .publish(&admission, &batch(&[retraction("obs-1", 2)]))
+            .expect("withdrawn");
+
+        // Age the fact rows past the horizon and sweep: the facts leave
+        // while the retracted event's tombstone still stands inside its
+        // own retention window.
+        let stale = now_ms() - USAGE_JOURNAL_RETENTION_MS - 1;
+        journal
+            .ledger
+            .connection
+            .execute(
+                "UPDATE usage_source_facts SET updated_at_ms=?1",
+                params![stale],
+            )
+            .expect("aged");
+        journal.sweep_retention(now_ms()).expect("swept");
+        assert!(facts(&journal).is_empty());
+
+        // The stale redelivery meets the tombstone: neither an older
+        // revision nor the withdrawal's own revision can restore what was
+        // retracted.
+        for revision in [1, 2] {
+            let report = journal
+                .publish(
+                    &admission,
+                    &batch(&[metric_upsert("obs-1", revision, "120")]),
+                )
+                .expect("delivered");
+            assert_eq!(report.events[0].outcome, EventOutcome::Superseded);
+            assert!(facts(&journal).is_empty());
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_tombstone_guards_through_the_skew_window_its_observation_stays_fresh() {
+        // An observation measured 23 hours ahead and retracted promptly:
+        // its tombstone outlives the ordinary horizon by the skew grace,
+        // because the original stays admissible for those 24 hours longer.
+        let root = root("tombstone-skew");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        let ahead = UsageObservation {
+            observed_at: OffsetDateTime::from_unix_timestamp(now_ms() / 1000 + 82_800)
+                .expect("fixture clock")
+                .format(&Rfc3339)
+                .expect("rfc3339"),
+            ..metric_upsert("obs-1", 1, "120")
+        };
+        journal
+            .publish(&admission, &batch(std::slice::from_ref(&ahead)))
+            .expect("settled");
+        journal
+            .publish(&admission, &batch(&[retraction("obs-1", 2)]))
+            .expect("withdrawn");
+
+        // Age the settlement stamps past the ordinary horizon but inside
+        // the skew grace: the tombstone still guards the fresh original.
+        journal
+            .ledger
+            .connection
+            .execute(
+                "UPDATE usage_source_events SET settled_at_ms=?1",
+                params![now_ms() - USAGE_JOURNAL_RETENTION_MS - 1],
+            )
+            .expect("aged");
+        journal.sweep_retention(now_ms()).expect("swept");
+        let tombstones: i64 = journal
+            .ledger
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_source_events WHERE retracted=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("counted");
+        assert_eq!(
+            tombstones, 1,
+            "the tombstone stands until the skew window closes"
+        );
+
+        let report = journal
+            .publish(&admission, &batch(&[ahead]))
+            .expect("delivered");
+        assert_eq!(report.events[0].outcome, EventOutcome::Superseded);
+        assert!(facts(&journal).is_empty(), "nothing resurrects");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_purged_tombstone_still_refuses_the_expired_replay() {
+        let root = root("tombstone-purged");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
+            .expect("settled");
+        journal
+            .publish(&admission, &batch(&[retraction("obs-1", 2)]))
+            .expect("withdrawn");
+
+        // Age every row — facts and the tombstone itself — past their
+        // bounds: the tombstone's bound is the horizon plus the skew grace,
+        // so the bounded store still sheds its metadata.
+        let stale = now_ms() - USAGE_JOURNAL_RETENTION_MS - MAX_OBSERVED_AHEAD_MS - 1;
+        for statement in [
+            "UPDATE usage_source_facts SET updated_at_ms=?1",
+            "UPDATE usage_source_events SET settled_at_ms=?1",
+        ] {
+            journal
+                .ledger
+                .connection
+                .execute(statement, params![stale])
+                .expect("aged");
+        }
+        journal.sweep_retention(now_ms()).expect("swept");
+        let remaining: i64 = journal
+            .ledger
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_source_events", [], |row| {
+                row.get(0)
+            })
+            .expect("counted");
+        assert_eq!(
+            remaining, 0,
+            "the tombstone outlives the horizon only by the skew grace"
+        );
+
+        // The same observation redelivered post-horizon — its measured
+        // timestamp is itself past the bound by then — is refused at
+        // admission, so nothing resurrects.
+        let expired = UsageObservation {
+            observed_at: "2020-01-01T00:00:00Z".to_owned(),
+            ..metric_upsert("obs-1", 1, "120")
+        };
+        let report = journal
+            .publish(&admission, &batch(&[expired]))
+            .expect("delivered");
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(
+            report.refused[0].failure.code,
+            "usage_journal_observation_expired"
+        );
+        assert!(facts(&journal).is_empty());
+
+        // What the bound cannot distinguish: a source re-dating the old
+        // observation as new. That is a fresh claim — settled as one —
+        // not the resurrection of the withdrawn measurement.
+        let report = journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
+            .expect("delivered");
+        assert_eq!(report.events[0].outcome, EventOutcome::Settled);
+        assert_eq!(facts(&journal).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_observation_claimed_beyond_the_skew_grace_is_refused() {
+        let root = root("ahead");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        // A measurement claiming to be over a day in the future would stay
+        // "fresh" longer than any tombstone lives; it is refused outright.
+        let ahead = OffsetDateTime::from_unix_timestamp(now_ms() / 1_000)
+            .expect("clock")
+            .saturating_add(time::Duration::hours(25))
+            .format(&Rfc3339)
+            .expect("rfc3339");
+        let claimed = UsageObservation {
+            observed_at: ahead,
+            ..metric_upsert("obs-1", 1, "120")
+        };
+        let report = journal
+            .publish(&admission, &batch(&[claimed]))
+            .expect("delivered");
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(
+            report.refused[0].failure.code,
+            "usage_journal_observation_ahead"
+        );
+        assert!(facts(&journal).is_empty());
+
+        // Within the grace — ordinary clock skew — the measurement settles.
+        let slight = OffsetDateTime::from_unix_timestamp(now_ms() / 1_000)
+            .expect("clock")
+            .saturating_add(time::Duration::hours(1))
+            .format(&Rfc3339)
+            .expect("rfc3339");
+        let skewed = UsageObservation {
+            observed_at: slight,
+            ..metric_upsert("obs-2", 1, "120")
+        };
+        journal
+            .publish(&admission, &batch(&[skewed]))
+            .expect("settled");
+        assert_eq!(facts(&journal).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_observation_measured_before_the_horizon_is_refused() {
+        let root = root("expired");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        // A measurement from before the horizon carries no live usage.
+        let stale = UsageObservation {
+            observed_at: "2020-01-01T00:00:00Z".to_owned(),
+            ..metric_upsert("obs-1", 1, "120")
+        };
+        let report = journal
+            .publish(&admission, &batch(&[stale]))
+            .expect("delivered");
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(
+            report.refused[0].failure.code,
+            "usage_journal_observation_expired"
+        );
+        assert!(facts(&journal).is_empty());
+        // An unreadable timestamp proves no freshness either.
+        let unreadable = UsageObservation {
+            observed_at: "eventually".to_owned(),
+            ..metric_upsert("obs-2", 1, "120")
+        };
+        let report = journal
+            .publish(&admission, &batch(&[unreadable]))
+            .expect("delivered");
+        assert_eq!(
+            report.refused[0].failure.code,
+            "usage_journal_observation_expired"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1854,6 +2396,54 @@ mod tests {
                 .expect("total")
                 .as_deref(),
             Some("320")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_expired_cursor_reads_as_absent_between_sweeps() {
+        // Retention is enforced on the read itself: a cursor past the
+        // horizon is absent whether or not the hourly sweep has run — a
+        // held-open journal used only for resume reads still honours it.
+        let root = root("cursor-expiry");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        journal
+            .admit_page(
+                &admission,
+                &pull(),
+                &otlp_page(OTLP_CUMULATIVE, "epoch-1", 7),
+            )
+            .expect("page settles");
+        assert_eq!(
+            journal
+                .durable_cursor(&admission.binding)
+                .expect("cursor")
+                .as_deref(),
+            Some("7@epoch-1")
+        );
+
+        // Age the cursor past the horizon without running the sweep.
+        journal
+            .ledger
+            .connection
+            .execute(
+                "UPDATE usage_source_cursors SET updated_at_ms=?1",
+                params![now_ms() - USAGE_JOURNAL_RETENTION_MS - 1],
+            )
+            .expect("aged");
+        assert_eq!(
+            journal.durable_cursor(&admission.binding).expect("cursor"),
+            None,
+            "an expired cursor is absent before the sweep removes it"
+        );
+        let request = journal
+            .resume_request(&admission, SCOPE, None)
+            .expect("request");
+        assert!(
+            request.cursor.is_none(),
+            "an expired position cannot resume a pull"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -2550,7 +3140,7 @@ mod tests {
             quality: Quality::Reported,
             eligibility: SettlementEligibility::SettlementEligible,
             source_ref: "native:agent-1".to_owned(),
-            observed_at: "2026-09-21T00:00:00Z".to_owned(),
+            observed_at: fresh_observed_at(),
         };
         let receipt = journal
             .record("native:agent-1", owned.clone())

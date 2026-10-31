@@ -6,7 +6,8 @@
 //! only from fields the response actually carried: a provider that does not
 //! publish a monthly quota has no monthly quota fact, not a quota of zero.
 
-use licoup_extension_contracts::{ApplicationFailure, is_namespaced};
+use token_usage_detector::UsageFailure;
+use token_usage_detector::names::is_namespaced;
 
 use crate::refusal;
 
@@ -94,7 +95,7 @@ impl BalanceFact {
     /// A percentage must parse inside `0`–`100`, a currency must be a
     /// three-letter code, an amount must be non-empty, and a custom window must
     /// be namespaced so two providers cannot collide on `promo`.
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         match self {
             Self::Credit {
                 remaining,

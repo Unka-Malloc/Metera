@@ -13,9 +13,10 @@ pub mod attribution;
 mod command;
 pub mod model_identity;
 mod params;
-mod registry;
+pub mod registry;
 
 pub mod contract;
+pub mod export;
 pub mod gateway;
 pub mod host;
 pub mod incremental;
@@ -28,3 +29,4 @@ pub mod window;
 
 pub use command::{report, scan};
 pub use host::{StatisticsHost, install_host};
+pub use registry::{EmptyModelRegistry, ModelRegistry, ResolvedModel};

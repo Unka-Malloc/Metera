@@ -7,8 +7,8 @@
 //! key and never opens a connection, which is the same line the usage side
 //! draws between observation and acquisition.
 
-use licoup_extension_contracts::ApplicationFailure;
 use serde_json::Value;
+use token_usage_detector::UsageFailure;
 
 use crate::binding::AccountBinding;
 
@@ -21,10 +21,10 @@ use crate::binding::AccountBinding;
 /// different one from the payload.
 ///
 /// `fetch` returns the decoded JSON body. A source that cannot reach the
-/// surface reports an [`ApplicationFailure`] rather than fabricating a
+/// surface reports an [`UsageFailure`] rather than fabricating a
 /// balance: an unreachable provider is a fact about availability, not a claim
 /// that nothing remains.
 pub trait BalanceSource {
     /// Fetch the provider's current balance/quota payload for `binding`.
-    fn fetch(&self, binding: &AccountBinding) -> Result<Value, ApplicationFailure>;
+    fn fetch(&self, binding: &AccountBinding) -> Result<Value, UsageFailure>;
 }

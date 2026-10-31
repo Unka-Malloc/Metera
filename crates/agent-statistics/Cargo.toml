@@ -1,6 +1,6 @@
 [package]
 name = "agent-statistics"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,12 +9,9 @@ description = "Local usage measurement, aggregation and metering journal engine:
 
 [dependencies]
 token-usage-detector.workspace = true
+collection-store.workspace = true
 acativa.workspace = true
 anyhow.workspace = true
-licoup-client-state.workspace = true
-licoup-extension-contracts.workspace = true
-licoup-foundation.workspace = true
-licoup-model-catalog.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

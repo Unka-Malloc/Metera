@@ -1,13 +1,12 @@
 [package]
 name = "token-usage-detector"
-version = "0.1.1"
+version = "0.2.1"
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.85"
 license.workspace = true
 repository.workspace = true
 description = "Detects token usage from conversation, session and stream records: the push, bounded-pull and cursor collection protocol, the host-side source binding, and the boundary normalizers."
 
 [dependencies]
-licoup-extension-contracts.workspace = true
 serde.workspace = true
 serde_json.workspace = true

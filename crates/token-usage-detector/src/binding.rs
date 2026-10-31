@@ -24,8 +24,9 @@
 //!   observation may only be attached to an invocation or an aggregate range the
 //!   user's work is already under.
 
-use licoup_extension_contracts::usage::{UsageObservation, self_asserted_binding_field};
-use licoup_extension_contracts::{ApplicationFailure, is_namespaced};
+use crate::failure::UsageFailure;
+use crate::names::is_namespaced;
+use crate::usage::{UsageObservation, self_asserted_binding_field};
 use serde_json::Value;
 
 use crate::collection::PublishBatch;
@@ -73,7 +74,7 @@ impl SourceBinding {
         generation: u64,
         source_epoch: impl Into<String>,
         scope_grants: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<Self, ApplicationFailure> {
+    ) -> Result<Self, UsageFailure> {
         let binding = Self {
             source_ref: source_ref.into(),
             extension_id: extension_id.into(),
@@ -86,7 +87,7 @@ impl SourceBinding {
         Ok(binding)
     }
 
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         if self.source_ref.is_empty() || self.source_ref.len() > MAX_SOURCE_REF_BYTES {
             return Err(refusal("usage_binding_invalid").with_field("sourceRef"));
         }
@@ -117,11 +118,11 @@ impl SourceBinding {
         &self,
         value: Value,
         measurement_ref: Option<&str>,
-    ) -> Result<BoundObservation, ApplicationFailure> {
-        if let Some(field) = self_asserted_binding_field(&value) {
+    ) -> Result<BoundObservation, UsageFailure> {
+        if let Some(field) = self_asserted_binding_field(&value)? {
             return Err(refusal("usage_source_self_asserted").with_field(&field));
         }
-        if let Some(field) = measurement_bound_field(&value) {
+        if let Some(field) = measurement_bound_field(&value)? {
             return Err(refusal("usage_source_self_asserted").with_field(&field));
         }
         let observation = UsageObservation::from_value(value)?;
@@ -137,12 +138,12 @@ impl SourceBinding {
         &self,
         observation: UsageObservation,
         measurement_ref: Option<&str>,
-    ) -> Result<BoundObservation, ApplicationFailure> {
+    ) -> Result<BoundObservation, UsageFailure> {
         observation.validate()?;
         if observation.source_epoch != self.source_epoch {
             return Err(refusal_with(
                 "usage_source_epoch_mismatch",
-                licoup_extension_contracts::RecoveryAction::ReconcileBeforeRetry,
+                crate::failure::RecoveryAction::ReconcileBeforeRetry,
             )
             .with_field("sourceEpoch")
             .with_presentation_arg("boundEpoch", &self.source_epoch));
@@ -150,9 +151,9 @@ impl SourceBinding {
         if !self.authorizes_scope(&observation.scope_ref) {
             return Err(refusal("usage_scope_not_authorized").with_field("scopeRef"));
         }
-        if let Some(measurement_ref) = measurement_ref
-            && (measurement_ref.is_empty() || measurement_ref.len() > MAX_MEASUREMENT_REF_BYTES)
-        {
+        if measurement_ref.is_some_and(|reference| {
+            reference.is_empty() || reference.len() > MAX_MEASUREMENT_REF_BYTES
+        }) {
             return Err(refusal("usage_binding_invalid").with_field("measurementRef"));
         }
         Ok(BoundObservation {
@@ -185,7 +186,7 @@ impl SourceBinding {
 pub struct BatchRefusal {
     /// The position in the batch, so the producer can point at the record.
     pub index: usize,
-    pub failure: ApplicationFailure,
+    pub failure: UsageFailure,
 }
 
 /// The result of binding a batch: what was accepted and what was refused.
@@ -253,39 +254,17 @@ impl BoundObservation {
 }
 
 /// The dotted path of the first payload field that asserts a correlation fact,
-/// if any.
-pub fn measurement_bound_field(value: &Value) -> Option<String> {
-    fn walk(value: &Value, path: &str, found: &mut Option<String>) {
-        if found.is_some() {
-            return;
-        }
-        match value {
-            Value::Object(map) => {
-                for (key, nested) in map {
-                    let normalized: String = key
-                        .chars()
-                        .filter(|character| *character != '_' && *character != '-')
-                        .flat_map(char::to_lowercase)
-                        .collect();
-                    if MEASUREMENT_BOUND_FIELDS.contains(&normalized.as_str()) {
-                        *found = Some(format!("{path}{key}"));
-                        return;
-                    }
-                    walk(nested, &format!("{path}{key}."), found);
-                }
-            }
-            Value::Array(items) => {
-                for (index, nested) in items.iter().enumerate() {
-                    walk(nested, &format!("{path}{index}."), found);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut found = None;
-    walk(value, "", &mut found);
-    found
+/// if any — under the same traversal bound the transport-bound scan enforces,
+/// so an over-budget payload is refused rather than under-scanned.
+pub fn measurement_bound_field(value: &Value) -> Result<Option<String>, UsageFailure> {
+    crate::usage::first_field_matching(value, |key| {
+        let normalized: String = key
+            .chars()
+            .filter(|character| *character != '_' && *character != '-')
+            .flat_map(char::to_lowercase)
+            .collect();
+        MEASUREMENT_BOUND_FIELDS.contains(&normalized.as_str())
+    })
 }
 
 #[cfg(test)]
@@ -294,7 +273,7 @@ mod tests {
 
     fn payload(id: &str) -> Value {
         serde_json::json!({
-            "schema": licoup_extension_contracts::wire::USAGE,
+            "schema": crate::usage::wire::USAGE,
             "observationId": id,
             "revision": 1,
             "operation": "upsert",

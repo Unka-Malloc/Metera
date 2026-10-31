@@ -8,8 +8,9 @@
 //! a convention: an undeclared unit, an undeclared aggregation or a series that
 //! names a metric nobody declared is refused.
 
-use licoup_extension_contracts::usage::Temporality;
-use licoup_extension_contracts::{ApplicationFailure, is_namespaced};
+use crate::failure::UsageFailure;
+use crate::names::is_namespaced;
+use crate::usage::Temporality;
 
 use crate::refusal;
 
@@ -71,7 +72,7 @@ impl MetricField {
         }
     }
 
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         if !is_namespaced(&self.metric) {
             return Err(refusal("usage_describe_invalid").with_field("fields.metric"));
         }
@@ -103,7 +104,7 @@ impl SeriesDeclaration {
         }
     }
 
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         if !is_namespaced(&self.metric) || self.label.is_empty() || self.unit.is_empty() {
             return Err(refusal("usage_describe_invalid").with_field("series"));
         }
@@ -132,7 +133,7 @@ impl SourceDescription {
     ///
     /// A series for an undeclared metric is refused rather than shown as a
     /// blank chart: a panel may not invent a field its source never claimed.
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         for (index, field) in self.fields.iter().enumerate() {
             field.validate()?;
             if self.fields[..index]

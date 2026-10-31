@@ -11,8 +11,8 @@
 //! monthly cap under the same subscription — so the mapping produces one fact
 //! per declared window, never a merged "the quota".
 
-use licoup_extension_contracts::ApplicationFailure;
 use serde_json::Value;
+use token_usage_detector::UsageFailure;
 
 use crate::binding::{AccountBinding, BoundBalance, self_asserted_account_field};
 use crate::fact::{BalanceFact, QuotaWindow};
@@ -83,7 +83,7 @@ impl BalanceMapping {
         response: &Value,
         binding: &AccountBinding,
         observed_at: impl Into<String>,
-    ) -> Result<Option<BoundBalance>, ApplicationFailure> {
+    ) -> Result<Option<BoundBalance>, UsageFailure> {
         if let Some(field) = self_asserted_account_field(response) {
             return Err(refusal("balance_self_asserted").with_field(&field));
         }
@@ -117,7 +117,7 @@ impl BalanceMapping {
         &self,
         response: &Value,
         mapping: &CreditMapping,
-    ) -> Result<Option<BalanceFact>, ApplicationFailure> {
+    ) -> Result<Option<BalanceFact>, UsageFailure> {
         let remaining = read_string(response, &mapping.remaining, "credit.remaining")?;
         let currency = read_string(response, &mapping.currency, "credit.currency")?;
         match (remaining, currency) {
@@ -147,7 +147,7 @@ impl BalanceMapping {
         &self,
         response: &Value,
         mapping: &QuotaMapping,
-    ) -> Result<Option<BalanceFact>, ApplicationFailure> {
+    ) -> Result<Option<BalanceFact>, UsageFailure> {
         let remaining_percent = match &mapping.remaining_percent {
             Some(path) => read_scalar(response, path, "quota.remainingPercent")?,
             None => None,
@@ -198,11 +198,7 @@ fn read_path<'a>(record: &'a Value, path: &str) -> Result<Option<&'a Value>, ()>
 /// Read a string-valued path. A missing field is `None`; a wrong shape is a
 /// refusal — the response said something, and pretending it did not would
 /// invent silence.
-fn read_string(
-    record: &Value,
-    path: &str,
-    field: &str,
-) -> Result<Option<String>, ApplicationFailure> {
+fn read_string(record: &Value, path: &str, field: &str) -> Result<Option<String>, UsageFailure> {
     match read_path(record, path)
         .map_err(|_| refusal("balance_mapping_invalid").with_field(field))?
     {
@@ -213,11 +209,7 @@ fn read_string(
 }
 
 /// Read a number-or-string scalar into its exact text form.
-fn read_scalar(
-    record: &Value,
-    path: &str,
-    field: &str,
-) -> Result<Option<String>, ApplicationFailure> {
+fn read_scalar(record: &Value, path: &str, field: &str) -> Result<Option<String>, UsageFailure> {
     match read_path(record, path)
         .map_err(|_| refusal("balance_mapping_invalid").with_field(field))?
     {

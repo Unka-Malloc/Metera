@@ -9,7 +9,7 @@
 //! `licoup.tokens.cached-input` (it does, through `licoup.tokens.input`), which
 //! is the difference between one total and a double count.
 
-use licoup_extension_contracts::usage::Temporality;
+use crate::usage::Temporality;
 
 use crate::describe::Aggregation;
 
@@ -151,7 +151,7 @@ pub fn includes(outer: &str, inner: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use licoup_extension_contracts::is_namespaced;
+    use crate::names::is_namespaced;
 
     #[test]
     fn every_general_metric_is_namespaced_and_declared_once() {

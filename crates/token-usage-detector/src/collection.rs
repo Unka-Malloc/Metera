@@ -17,9 +17,13 @@
 //! [`Cursor::check_epoch`] exists and why a stale cursor is a refusal the caller
 //! reconciles rather than an empty page.
 
-use licoup_extension_contracts::transport::Framing;
-use licoup_extension_contracts::usage::UsageObservation;
-use licoup_extension_contracts::{ApplicationFailure, RecoveryAction};
+use crate::framing::Framing;
+
+/// The published method names a usage source answers to.
+pub const METHOD_USAGE_PUBLISH: &str = "usage.publish";
+pub const METHOD_USAGE_QUERY: &str = "usage.query";
+use crate::failure::{RecoveryAction, UsageFailure};
+use crate::usage::UsageObservation;
 use serde_json::Value;
 
 use crate::{refusal, refusal_with};
@@ -71,8 +75,8 @@ impl CollectionMode {
     /// The profile method this shape is carried by.
     pub const fn method(self) -> &'static str {
         match self {
-            Self::Push => licoup_extension_contracts::profile::METHOD_USAGE_PUBLISH,
-            Self::Pull | Self::Cursor => licoup_extension_contracts::profile::METHOD_USAGE_QUERY,
+            Self::Push => METHOD_USAGE_PUBLISH,
+            Self::Pull | Self::Cursor => METHOD_USAGE_QUERY,
         }
     }
 
@@ -105,7 +109,7 @@ impl PublishBatch {
     /// sends nothing is a source that should not have been asked, and accepting
     /// it would make "no observations" indistinguishable from "the batch was
     /// dropped".
-    pub fn new(observations: Vec<Value>) -> Result<Self, ApplicationFailure> {
+    pub fn new(observations: Vec<Value>) -> Result<Self, UsageFailure> {
         if observations.is_empty() {
             return Err(refusal("usage_batch_empty").with_field("observations"));
         }
@@ -130,7 +134,7 @@ impl PublishBatch {
     }
 
     /// The encoded size of the batch as sent.
-    pub fn encoded_len(&self) -> Result<usize, ApplicationFailure> {
+    pub fn encoded_len(&self) -> Result<usize, UsageFailure> {
         serde_json::to_vec(&self.observations)
             .map(|encoded| encoded.len())
             .map_err(|_| refusal("usage_batch_unencodable").with_field("observations"))
@@ -141,7 +145,7 @@ impl PublishBatch {
     /// The check includes [`ENVELOPE_ALLOWANCE_BYTES`], so a batch that passes
     /// here fits the carrier rather than merely fitting the carrier minus its
     /// own envelope.
-    pub fn check_frame(&self, framing: &Framing) -> Result<usize, ApplicationFailure> {
+    pub fn check_frame(&self, framing: &Framing) -> Result<usize, UsageFailure> {
         let encoded = self.encoded_len()?;
         let frame = encoded.saturating_add(ENVELOPE_ALLOWANCE_BYTES);
         framing.check_frame(frame)?;
@@ -165,7 +169,7 @@ impl QueryRequest {
         scope_ref: impl Into<String>,
         cursor: Option<String>,
         limit: Option<u32>,
-    ) -> Result<Self, ApplicationFailure> {
+    ) -> Result<Self, UsageFailure> {
         let request = Self {
             scope_ref: scope_ref.into(),
             cursor,
@@ -185,7 +189,7 @@ impl QueryRequest {
 
     /// Structural validation: a scope, a limit within bounds, and a cursor that
     /// parses.
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         if self.scope_ref.is_empty() {
             return Err(refusal("usage_query_invalid").with_field("scopeRef"));
         }
@@ -230,7 +234,7 @@ impl QueryPage {
 
     /// Structural validation, including the rule that a page may not carry an
     /// observation from another epoch or another scope.
-    pub fn validate(&self) -> Result<(), ApplicationFailure> {
+    pub fn validate(&self) -> Result<(), UsageFailure> {
         if self.source_epoch.is_empty() {
             return Err(refusal("usage_page_invalid").with_field("sourceEpoch"));
         }
@@ -260,7 +264,7 @@ impl QueryPage {
 
     /// Refuse a page that does not answer the request it was read for.
     ///
-    /// [`validate`] is structural: any page consistent with itself passes, so a
+    /// [`QueryPage::validate`] is structural: any page consistent with itself passes, so a
     /// page stamped with *another* authorized scope would still validate. The
     /// response must instead equal the request the host issued:
     ///
@@ -270,7 +274,7 @@ impl QueryPage {
     /// - a resumed request's cursor belongs to the epoch the page was read
     ///   from — an old-epoch cursor against a post-reset page is the stale
     ///   resume the cursor exists to refuse.
-    pub fn check_request(&self, request: &QueryRequest) -> Result<(), ApplicationFailure> {
+    pub fn check_request(&self, request: &QueryRequest) -> Result<(), UsageFailure> {
         if self.scope_ref != request.scope_ref {
             return Err(refusal("usage_page_scope_mismatch")
                 .with_field("scopeRef")
@@ -302,7 +306,7 @@ pub struct Cursor {
 
 impl Cursor {
     /// Build a cursor. The epoch must be non-empty and the encoded text bounded.
-    pub fn new(source_epoch: impl Into<String>, sequence: u64) -> Result<Self, ApplicationFailure> {
+    pub fn new(source_epoch: impl Into<String>, sequence: u64) -> Result<Self, UsageFailure> {
         let cursor = Self {
             sequence,
             source_epoch: source_epoch.into(),
@@ -312,7 +316,7 @@ impl Cursor {
     }
 
     /// Parse a cursor that was issued by a host.
-    pub fn parse(text: &str) -> Result<Self, ApplicationFailure> {
+    pub fn parse(text: &str) -> Result<Self, UsageFailure> {
         if text.is_empty() || text.len() > MAX_CURSOR_BYTES {
             return Err(refusal("usage_cursor_invalid").with_field("cursor"));
         }
@@ -344,7 +348,7 @@ impl Cursor {
     }
 
     /// The position after this one, for the page that ends here.
-    pub fn next(&self) -> Result<Self, ApplicationFailure> {
+    pub fn next(&self) -> Result<Self, UsageFailure> {
         Self::new(
             self.source_epoch.clone(),
             self.sequence
@@ -359,7 +363,7 @@ impl Cursor {
     /// cursor there is not an empty read: it is a read of a series that no
     /// longer exists, and the caller reconciles instead of treating it as
     /// "nothing new".
-    pub fn check_epoch(&self, current_epoch: &str) -> Result<(), ApplicationFailure> {
+    pub fn check_epoch(&self, current_epoch: &str) -> Result<(), UsageFailure> {
         if self.source_epoch == current_epoch {
             return Ok(());
         }
@@ -372,7 +376,7 @@ impl Cursor {
         .with_presentation_arg("currentEpoch", current_epoch))
     }
 
-    fn check_encoded_len(&self) -> Result<(), ApplicationFailure> {
+    fn check_encoded_len(&self) -> Result<(), UsageFailure> {
         if self.source_epoch.is_empty() || self.encode().len() > MAX_CURSOR_BYTES {
             return Err(refusal("usage_cursor_invalid").with_field("cursor"));
         }
@@ -386,7 +390,7 @@ mod tests {
 
     fn payload(id: &str) -> Value {
         serde_json::json!({
-            "schema": licoup_extension_contracts::wire::USAGE,
+            "schema": crate::usage::wire::USAGE,
             "observationId": id,
             "revision": 1,
             "operation": "upsert",
@@ -429,12 +433,14 @@ mod tests {
         let encoded = batch.encoded_len().expect("encoded");
         assert!(
             encoded + ENVELOPE_ALLOWANCE_BYTES
-                > Framing::new(4 * 1024, 4 * 1024).negotiated_max_frame_bytes(),
+                > Framing::new(4 * 1024, 4 * 1024)
+                    .unwrap()
+                    .negotiated_max_frame_bytes(),
             "the batch must be large enough to exceed the smallest negotiated bound"
         );
-        let roomy = Framing::new(64 * 1024, 64 * 1024);
+        let roomy = Framing::new(64 * 1024, 64 * 1024).unwrap();
         assert!(batch.check_frame(&roomy).is_ok());
-        let tight = Framing::new(4 * 1024, 4 * 1024);
+        let tight = Framing::new(4 * 1024, 4 * 1024).unwrap();
         assert_eq!(
             batch.check_frame(&tight).expect_err("over bound").code,
             "transport_frame_oversize"
@@ -507,8 +513,7 @@ mod tests {
     #[test]
     fn a_page_may_not_smuggle_another_scope_or_epoch() {
         let observation =
-            licoup_extension_contracts::usage::UsageObservation::from_value(payload("obs-1"))
-                .expect("observation");
+            crate::usage::UsageObservation::from_value(payload("obs-1")).expect("observation");
         let mut page = QueryPage::empty("epoch-1", "scope-1");
         page.observations = vec![observation.clone()];
         assert!(page.validate().is_ok());
@@ -546,10 +551,8 @@ mod tests {
         let request = QueryRequest::new("scope-a", None, Some(1)).expect("request");
         let mut page = QueryPage::empty("epoch-1", "scope-a");
         page.observations = vec![
-            licoup_extension_contracts::usage::UsageObservation::from_value(payload("obs-1"))
-                .expect("one"),
-            licoup_extension_contracts::usage::UsageObservation::from_value(payload("obs-2"))
-                .expect("two"),
+            crate::usage::UsageObservation::from_value(payload("obs-1")).expect("one"),
+            crate::usage::UsageObservation::from_value(payload("obs-2")).expect("two"),
         ];
         let failure = page
             .check_request(&request)

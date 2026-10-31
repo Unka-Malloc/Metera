@@ -10,7 +10,7 @@ use acativa::usage_ledger::{
     WORKFLOW_LEDGER_REPORT_SCHEMA, WORKFLOW_LEDGER_RESULT_KIND, WORKFLOW_LEDGER_SCHEMA_VERSION,
 };
 use anyhow::{Context, Result};
-use licoup_client_state::ClientStateStore;
+use collection_store::CollectionStore;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -45,7 +45,7 @@ pub fn read_retained_reports(
     params: &Value,
     agent_filter: Option<&str>,
     limit: usize,
-    registry: &crate::registry::RegistrySnapshot,
+    registry: &dyn crate::registry::ModelRegistry,
 ) -> Result<Vec<Value>> {
     let store =
         client_state_store(params).context("usage report snapshot storage could not be opened")?;
@@ -154,13 +154,13 @@ fn project_supported_agents(report: &mut Value, supported: &BTreeSet<&str>) {
     report["summary"].as_object_mut().unwrap().extend(totals);
 }
 
-pub fn client_state_store(params: &Value) -> Result<ClientStateStore> {
+pub fn client_state_store(params: &Value) -> Result<CollectionStore> {
     if let Some(path) = text_param(params, &["stateRoot"])
         && !path.trim().is_empty()
     {
-        return ClientStateStore::new(PathBuf::from(path));
+        return CollectionStore::new(PathBuf::from(path));
     }
-    ClientStateStore::portable()
+    CollectionStore::portable()
 }
 
 fn is_current_report(report: &Value) -> bool {
@@ -215,6 +215,7 @@ fn report_has_agent(report: &Value, agent_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::TestRegistry;
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -253,7 +254,7 @@ mod tests {
             }}
         ]);
         persist_report(&params, &stored).unwrap();
-        let registry = crate::registry::RegistrySnapshot::from_catalog(json!({
+        let registry = TestRegistry::from_catalog(json!({
             "models":{"moonshotai/kimi-k3":{"name":"Kimi K3"}},"providers":{}
         }))
         .unwrap();
@@ -299,7 +300,7 @@ mod tests {
         let retained = store.read_collection(REPORT_COLLECTION).unwrap();
         assert_eq!(retained["items"].as_array().unwrap().len(), MAX_REPORTS);
         let codex =
-            read_retained_reports(&params, Some("codex"), 3, &crate::registry::snapshot()).unwrap();
+            read_retained_reports(&params, Some("codex"), 3, &TestRegistry::empty()).unwrap();
         assert_eq!(codex.len(), 3);
         assert!(codex.iter().all(|item| report_has_agent(item, "codex")));
         fs::remove_dir_all(root).unwrap();
@@ -370,7 +371,7 @@ mod tests {
         let padding = budget - base_bytes;
         collection["items"][0]["syntheticPadding"] = json!("x".repeat(padding / 2));
         collection["items"][1]["syntheticPadding"] = json!("x".repeat(padding - padding / 2));
-        let registry = crate::registry::snapshot();
+        let registry = TestRegistry::empty();
         let mut expected = collection["items"][1].clone();
         normalize_retained_report(&mut expected, &registry);
         assert!(
@@ -416,8 +417,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let reports =
-            read_retained_reports(&params, None, 10, &crate::registry::snapshot()).unwrap();
+        let reports = read_retained_reports(&params, None, 10, &TestRegistry::empty()).unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0]["schemaVersion"], AGENT_USAGE_SCHEMA_VERSION);
         fs::remove_dir_all(root).unwrap();
@@ -445,8 +445,7 @@ mod tests {
         store
             .write_collection(REPORT_COLLECTION, json!({ "items": [legacy, current] }))
             .unwrap();
-        let reports =
-            read_retained_reports(&params, None, 10, &crate::registry::snapshot()).unwrap();
+        let reports = read_retained_reports(&params, None, 10, &TestRegistry::empty()).unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(
             reports[0]["workflow"]["schemaVersion"],

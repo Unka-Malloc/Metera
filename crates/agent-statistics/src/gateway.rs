@@ -2,9 +2,7 @@
 //! local LLM Gateway. This is intentionally separate from agent token usage.
 
 use anyhow::Result;
-use licoup_foundation::platform::file_security::{
-    atomic_write_private_text, read_private_text_bounded,
-};
+use collection_store::fs::{atomic_write_private_text_bounded, read_private_text_bounded};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -15,21 +13,25 @@ use time::OffsetDateTime;
 const SCHEMA: &str = "licoup.llm-gateway-usage.v1";
 const MAX_USAGE_BYTES: usize = 512 * 1024;
 const MAX_DAYS: usize = 90;
-const MAX_MODELS_PER_DAY: usize = 64;
+pub(crate) const MAX_MODELS_PER_DAY: usize = 64;
 const MAX_MODEL_BYTES: usize = 128;
 
+/// One retained day of request counters. Constructed only by the recorder;
+/// read by the snapshot and the metrics exposition.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UsageDay {
-    agents: BTreeMap<String, u64>,
-    models: BTreeMap<String, u64>,
+pub struct UsageDay {
+    pub(crate) agents: BTreeMap<String, u64>,
+    pub(crate) models: BTreeMap<String, u64>,
 }
 
+/// The retained request-counter document: per day, the requests the gateway
+/// handled per calling agent and per model.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UsageDocument {
-    schema_version: String,
-    days: BTreeMap<String, UsageDay>,
+pub struct UsageDocument {
+    pub(crate) schema_version: String,
+    pub(crate) days: BTreeMap<String, UsageDay>,
 }
 
 impl Default for UsageDocument {
@@ -83,8 +85,17 @@ impl GatewayUsageRecorder {
             document.days.remove(&oldest);
         }
         if let Ok(encoded) = serde_json::to_string(&*document) {
-            let _ = atomic_write_private_text(&self.path, &encoded);
+            let _ = atomic_write_private_text_bounded(&self.path, &encoded, MAX_USAGE_BYTES);
         }
+    }
+
+    /// A consistent copy of the retained document, for read-only projections
+    /// such as the metrics exposition.
+    pub fn document(&self) -> UsageDocument {
+        self.document
+            .lock()
+            .map(|document| document.clone())
+            .unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> Value {
@@ -158,7 +169,7 @@ mod tests {
     fn recorder_persists_separate_agent_and_model_request_counts() {
         let root =
             std::env::temp_dir().join(format!("licoup-gateway-usage-{}", uuid::Uuid::new_v4()));
-        licoup_foundation::platform::file_security::ensure_private_dir(&root).unwrap();
+        collection_store::fs::ensure_private_dir(&root).unwrap();
         let path = root.join("usage.json");
         let recorder = GatewayUsageRecorder::open(path.clone()).unwrap();
         recorder.record(

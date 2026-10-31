@@ -1,5 +1,8 @@
 //! Bounded normalization of explicit token-usage records from local agent history.
 
+use crate::contract::{
+    ADDITIVE_CACHE_READ_FIELDS, ADDITIVE_CACHE_WRITE_FIELDS, CounterReading, counter_reading,
+};
 use serde_json::{Map, Value, json};
 
 const MAX_USAGE_NESTING_DEPTH: usize = 4;
@@ -97,16 +100,51 @@ pub struct UsageFields {
     total_tokens: u64,
     explicit_fields: usize,
     normalized_additive_semantics: bool,
+    /// An addition that overflowed poisons the whole record: a saturated
+    /// count is a number the record never wrote, so `to_json` refuses it.
+    tainted: bool,
 }
 
 impl UsageFields {
+    /// Checked accumulation into one counter; an overflow marks the record
+    /// tainted rather than emitting a saturated count.
+    fn add_prompt(&mut self, amount: u64) {
+        match self.prompt_tokens.checked_add(amount) {
+            Some(sum) => self.prompt_tokens = sum,
+            None => self.tainted = true,
+        }
+    }
+
+    fn add_cached_input(&mut self, amount: u64) {
+        match self.cached_input_tokens.checked_add(amount) {
+            Some(sum) => self.cached_input_tokens = sum,
+            None => self.tainted = true,
+        }
+    }
+
+    fn add_completion(&mut self, amount: u64) {
+        match self.completion_tokens.checked_add(amount) {
+            Some(sum) => self.completion_tokens = sum,
+            None => self.tainted = true,
+        }
+    }
+
+    fn add_total(&mut self, amount: u64) {
+        match self.total_tokens.checked_add(amount) {
+            Some(sum) => self.total_tokens = sum,
+            None => self.tainted = true,
+        }
+    }
+
     pub fn to_json(&self) -> Option<Value> {
-        if self.explicit_fields == 0 {
+        // A tainted record produced no usage: refusing to emit is the only
+        // honest answer where a wrong count would pass for a real one.
+        if self.explicit_fields == 0 || self.tainted {
             return None;
         }
         let mut prompt_tokens = self.prompt_tokens;
         let mut completion_tokens = self.completion_tokens;
-        let field_total = prompt_tokens.saturating_add(completion_tokens);
+        let field_total = prompt_tokens.checked_add(completion_tokens)?;
         let total_tokens = if self.normalized_additive_semantics {
             field_total
         } else if self.total_tokens > 0 {
@@ -171,30 +209,19 @@ pub fn collect_token_usage(value: &Value, depth: usize, usage: &mut UsageFields)
         }
     }
     let normalized_input_output = object.contains_key("input") && object.contains_key("output");
-    let kimi_additive_semantics = object.contains_key("inputOther")
+    // Additive semantics are detected over the same alias inventory the
+    // counters fold from: every recognized additive spelling marks the
+    // record additive — a spelling one side counted and the other did not
+    // would let a pre-cache total reconcile the folded count back down.
+    let additive_shape = object.contains_key("inputOther")
         || object.contains_key("input_other")
-        || object.contains_key("inputCacheRead")
-        || object.contains_key("input_cache_read")
-        || object.contains_key("inputCacheCreation")
-        || object.contains_key("input_cache_creation");
-    let flat_additive_cache = [
-        "cacheReadTokens",
-        "cache_read_tokens",
-        "cacheRead",
-        "cache_read",
-        "cacheCreationInputTokens",
-        "cache_creation_input_tokens",
-        "cacheWriteTokens",
-        "cache_write_tokens",
-        "cacheWrite",
-        "cache_write",
-    ]
-    .iter()
-    .any(|key| object.contains_key(*key));
+        || ADDITIVE_CACHE_READ_FIELDS
+            .iter()
+            .chain(ADDITIVE_CACHE_WRITE_FIELDS)
+            .any(|key| object.contains_key(*key));
     usage.normalized_additive_semantics |= (normalized_input_output
         && object.get("cache").and_then(Value::as_object).is_some())
-        || kimi_additive_semantics
-        || flat_additive_cache;
+        || additive_shape;
     let base_prompt = token_count_field(
         object,
         &[
@@ -213,6 +240,10 @@ pub fn collect_token_usage(value: &Value, depth: usize, usage: &mut UsageFields)
         usage,
     );
     let fields_before_cached = usage.explicit_fields;
+    // Only spellings reported *inside* the base count belong here: Anthropic's
+    // `cache_read_input_tokens` is not one — Anthropic reports it beside
+    // `cache_creation_input_tokens`, outside `input_tokens`, so it folds in
+    // the additive read below rather than being capped by the base.
     let mut cached_subset = token_count_field(
         object,
         &[
@@ -224,78 +255,44 @@ pub fn collect_token_usage(value: &Value, depth: usize, usage: &mut UsageFields)
             "total_cached_tokens",
             "cachedContentTokenCount",
             "cached_content_token_count",
-            "cacheReadInputTokens",
-            "cache_read_input_tokens",
         ],
         usage,
     );
-    if usage.explicit_fields == fields_before_cached
-        && let Some(cached) = ["prompt_tokens_details", "input_tokens_details"]
-            .into_iter()
-            .filter_map(|key| object.get(key))
-            .find_map(|details| details.get("cached_tokens").and_then(token_count_value))
-    {
-        cached_subset = cached;
-        usage.explicit_fields += 1;
+    if usage.explicit_fields == fields_before_cached {
+        for key in ["prompt_tokens_details", "input_tokens_details"] {
+            let Some(details) = object.get(key).and_then(Value::as_object) else {
+                continue;
+            };
+            match counter_reading(details, &["cached_tokens"]) {
+                CounterReading::Counted(cached) => {
+                    cached_subset = cached;
+                    usage.explicit_fields += 1;
+                    break;
+                }
+                CounterReading::Uncounted => usage.tainted = true,
+                CounterReading::Absent => {}
+            }
+        }
     }
-    let cache_read = token_count_field(
-        object,
-        &[
-            "cacheReadTokens",
-            "cache_read_tokens",
-            "cacheRead",
-            "cache_read",
-            "inputCacheRead",
-            "input_cache_read",
-        ],
-        usage,
-    );
-    let cache_write = token_count_field(
-        object,
-        &[
-            "cacheCreationInputTokens",
-            "cache_creation_input_tokens",
-            "cacheWriteInputTokens",
-            "cache_write_input_tokens",
-            "cacheWriteTokens",
-            "cache_write_tokens",
-            "cacheWrite",
-            "cache_write",
-            "inputCacheWriteTokens",
-            "input_cache_write_tokens",
-            "inputCacheCreation",
-            "input_cache_creation",
-        ],
-        usage,
-    );
-    usage.prompt_tokens = usage
-        .prompt_tokens
-        .saturating_add(base_prompt)
-        .saturating_add(cache_read)
-        .saturating_add(cache_write);
-    usage.cached_input_tokens = usage
-        .cached_input_tokens
-        .saturating_add(cached_subset.min(base_prompt))
-        .saturating_add(cache_read);
+    let cache_read = token_count_field(object, ADDITIVE_CACHE_READ_FIELDS, usage);
+    let cache_write = token_count_field(object, ADDITIVE_CACHE_WRITE_FIELDS, usage);
+    usage.add_prompt(base_prompt);
+    usage.add_prompt(cache_read);
+    usage.add_prompt(cache_write);
+    usage.add_cached_input(cached_subset.min(base_prompt));
+    usage.add_cached_input(cache_read);
     if let Some(cache) = object.get("cache").and_then(Value::as_object) {
         let normalized_cache_read = token_count_field(cache, &["read"], usage);
         let normalized_cache_write = token_count_field(cache, &["write"], usage);
-        usage.prompt_tokens = usage
-            .prompt_tokens
-            .saturating_add(normalized_cache_read)
-            .saturating_add(normalized_cache_write);
-        usage.cached_input_tokens = usage
-            .cached_input_tokens
-            .saturating_add(normalized_cache_read);
+        usage.add_prompt(normalized_cache_read);
+        usage.add_prompt(normalized_cache_write);
+        usage.add_cached_input(normalized_cache_read);
     }
     if normalized_input_output {
-        usage.completion_tokens = usage.completion_tokens.saturating_add(token_count_field(
-            object,
-            &["reasoning"],
-            usage,
-        ));
+        let count = token_count_field(object, &["reasoning"], usage);
+        usage.add_completion(count);
     }
-    usage.completion_tokens = usage.completion_tokens.saturating_add(token_count_field(
+    let count = token_count_field(
         object,
         &[
             "completionTokens",
@@ -311,8 +308,9 @@ pub fn collect_token_usage(value: &Value, depth: usize, usage: &mut UsageFields)
             "output",
         ],
         usage,
-    ));
-    usage.completion_tokens = usage.completion_tokens.saturating_add(token_count_field(
+    );
+    usage.add_completion(count);
+    let count = token_count_field(
         object,
         &[
             "reasoningTokens",
@@ -323,13 +321,15 @@ pub fn collect_token_usage(value: &Value, depth: usize, usage: &mut UsageFields)
             "total_thought_tokens",
         ],
         usage,
-    ));
-    usage.completion_tokens = usage.completion_tokens.saturating_add(token_count_field(
+    );
+    usage.add_completion(count);
+    let count = token_count_field(
         object,
         &["totalToolUseTokens", "total_tool_use_tokens"],
         usage,
-    ));
-    usage.total_tokens = usage.total_tokens.saturating_add(token_count_field(
+    );
+    usage.add_completion(count);
+    let count = token_total_field(
         object,
         &[
             "totalTokens",
@@ -339,26 +339,38 @@ pub fn collect_token_usage(value: &Value, depth: usize, usage: &mut UsageFields)
             "total",
         ],
         usage,
-    ));
+    );
+    usage.add_total(count);
 }
 
 fn token_count_field(object: &Map<String, Value>, keys: &[&str], usage: &mut UsageFields) -> u64 {
-    keys.iter()
-        .find_map(|key| object.get(*key).and_then(token_count_value))
-        .inspect(|_| usage.explicit_fields += 1)
-        .unwrap_or(0)
+    match counter_reading(object, keys) {
+        CounterReading::Counted(count) => {
+            usage.explicit_fields += 1;
+            count
+        }
+        // A counter the record named but never counted is unknown, not
+        // zero: folding it as absent would emit a precise partial total,
+        // so the record is refused downstream.
+        CounterReading::Uncounted => {
+            usage.tainted = true;
+            0
+        }
+        CounterReading::Absent => 0,
+    }
 }
 
-pub fn token_count_value(value: &Value) -> Option<u64> {
-    if let Some(number) = value.as_u64() {
-        return Some(number);
+/// The authoritative total reconciles the folded counts but is not one of
+/// them: a named-but-uncounted total leaves the fold honest, so it never
+/// taints the record.
+fn token_total_field(object: &Map<String, Value>, keys: &[&str], usage: &mut UsageFields) -> u64 {
+    match counter_reading(object, keys) {
+        CounterReading::Counted(count) => {
+            usage.explicit_fields += 1;
+            count
+        }
+        _ => 0,
     }
-    if let Some(number) = value.as_i64().filter(|number| *number >= 0) {
-        return Some(number as u64);
-    }
-    value
-        .as_str()
-        .and_then(|text| text.trim().parse::<u64>().ok())
 }
 
 #[cfg(test)]
@@ -380,6 +392,54 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn an_overflowing_additive_count_refuses_the_record() {
+        // A saturated count is a number the record never wrote: every
+        // additive fold is checked, and an overflow refuses the record
+        // rather than emitting a clamped total.
+        for usage in [
+            json!({"prompt_tokens": u64::MAX, "cache_read_input_tokens": 1}),
+            json!({"prompt_tokens": u64::MAX, "cache_creation_input_tokens": 1}),
+            json!({"prompt_tokens": u64::MAX, "output_tokens": 1}),
+        ] {
+            assert!(
+                extract_token_usage(&json!({"usage": usage})).is_none(),
+                "an overflowing additive record is refused: {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_but_uncounted_counter_refuses_the_record() {
+        // `null` or non-numeric is not zero: the record named a counter it
+        // never counted, so folding it as absent would emit a precise
+        // partial total.
+        for usage in [
+            json!({"prompt_tokens": 100, "cache_read_input_tokens": null, "completion_tokens": 20, "total_tokens": 120}),
+            json!({"prompt_tokens": 100, "cache_creation_input_tokens": "n/a", "completion_tokens": 20}),
+            json!({"prompt_tokens": null, "completion_tokens": 20}),
+            json!({"prompt_tokens": 100, "completion_tokens": "unknown"}),
+            json!({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": null}}),
+        ] {
+            assert!(
+                extract_token_usage(&json!({"usage": usage})).is_none(),
+                "a named-but-uncounted counter refuses the record: {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_uncounted_reconciliation_total_still_folds() {
+        // The reported total only reconciles counted constituents — it is
+        // never folded itself — so a named-but-uncounted total leaves the
+        // fold honest.
+        let usage = extract_token_usage(
+            &json!({"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": null}}),
+        )
+        .unwrap();
+        assert_eq!(usage["totalTokens"], 120);
     }
 
     #[test]
@@ -441,6 +501,27 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_cache_categories_are_additive_to_the_base_input() {
+        // The real Anthropic shape: `input_tokens` excludes both cache
+        // categories — `cache_read_input_tokens` sits in the same additive
+        // position as `cache_creation_input_tokens` — so the input folds to
+        // 10 + 30 + 5 with the cache-read share as the cached subset.
+        let usage = extract_token_usage(&json!({
+            "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 5,
+                "output_tokens": 8
+            }
+        }))
+        .unwrap();
+        assert_eq!(usage["promptTokens"], 45);
+        assert_eq!(usage["cachedInputTokens"], 30);
+        assert_eq!(usage["completionTokens"], 8);
+        assert_eq!(usage["totalTokens"], 53);
+    }
+
+    #[test]
     fn kimi_status_usage_keeps_additive_cache_categories() {
         let usage = extract_token_usage(&json!({
             "token_usage": {
@@ -473,5 +554,24 @@ mod tests {
         assert_eq!(usage["cachedInputTokens"], 20);
         assert_eq!(usage["completionTokens"], 15);
         assert_eq!(usage["totalTokens"], 120);
+    }
+
+    #[test]
+    fn every_recognized_additive_spelling_marks_the_record_additive() {
+        // `cacheWriteInputTokens` folds into the prompt and marks the record
+        // additive: the provider's pre-cache total may not reconcile the
+        // folded sum back down — counting and semantics share one table.
+        let usage = extract_token_usage(&json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "cacheWriteInputTokens": 5,
+                "total_tokens": 120
+            }
+        }))
+        .unwrap();
+        assert_eq!(usage["promptTokens"], 105);
+        assert_eq!(usage["completionTokens"], 20);
+        assert_eq!(usage["totalTokens"], 125);
     }
 }

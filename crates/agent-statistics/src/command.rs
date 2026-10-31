@@ -6,11 +6,13 @@ use crate::contract::{
 };
 use crate::params::{number_param, text_param};
 use crate::persistence::{persist_report, read_retained_reports};
+use crate::registry::{EmptyModelRegistry, ModelRegistry};
 use crate::window::UsageWindow;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -68,7 +70,7 @@ pub fn scan(params: &Value) -> Result<Value> {
                 .get(def.id)
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_owned()),
-            "history": history.to_json_for_agent(Some(def.id), &registry),
+            "history": history.to_json_for_agent(Some(def.id), registry.as_ref()),
             "confidence": confidence,
             "metering": metering,
             "sources": {
@@ -134,7 +136,7 @@ pub fn report(params: &Value) -> Result<Value> {
     let agent_filter =
         text_param(params, &["agent", "target"]).map(|value| normalize_agent_id(&value));
     let limit = number_param(params, "limit").unwrap_or(10) as usize;
-    let reports = read_retained_reports(params, agent_filter.as_deref(), limit, &registry)?;
+    let reports = read_retained_reports(params, agent_filter.as_deref(), limit, registry.as_ref())?;
     let workflow_report_value = acativa::usage_ledger::workflow_report(params)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     // What the base ledger holds right now: the facts the scans settled and the
@@ -157,13 +159,11 @@ pub fn report(params: &Value) -> Result<Value> {
     }))
 }
 
-fn model_registry_snapshot(
-    state_root: Option<&Path>,
-) -> std::sync::Arc<licoup_model_catalog::identity::RegistrySnapshot> {
-    crate::host::host().map_or_else(
-        |_| licoup_model_catalog::identity::refresh_cached_snapshot_for_state_root(state_root),
-        |host| (host.model_registry_snapshot)(state_root),
-    )
+fn model_registry_snapshot(state_root: Option<&Path>) -> Arc<dyn ModelRegistry> {
+    match crate::host::host() {
+        Ok(host) => (host.model_registry_snapshot)(state_root),
+        Err(_) => Arc::new(EmptyModelRegistry),
+    }
 }
 
 fn summarize_agent_history(

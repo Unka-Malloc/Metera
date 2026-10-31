@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/agent-statistics",
+    "crates/collection-store",
     "crates/balance-detector",
     "crates/token-usage-detector",
 ]
@@ -10,17 +11,15 @@ members = [
 edition = "2024"
 rust-version = "1.95.0"
 license = "Apache-2.0"
-repository = "https://github.com/Unka-Malloc/Agent-Statistics.git"
+repository = "https://github.com/Unka-Malloc/Metera"
 
 [workspace.dependencies]
-token-usage-detector = { path = "crates/token-usage-detector", version = "0.1.1" }
+token-usage-detector = { path = "crates/token-usage-detector", version = "0.2.1" }
+collection-store = { path = "crates/collection-store", version = "0.1.0" }
 # The flywheel owns the graph-run usage store this crate's journal shares.
 acativa = "0.2.0"
 anyhow = "1"
-licoup-client-state = "0.3.0"
-licoup-extension-contracts = "0.3.0"
-licoup-foundation = "0.3.0"
-licoup-model-catalog = "0.3.0"
+libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

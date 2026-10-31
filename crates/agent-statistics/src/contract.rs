@@ -3,17 +3,54 @@
 use crate::model_identity::project_model_usage;
 pub use crate::variant::UsageVariant;
 pub const USAGE_PARSER_REVISION: &str = "request-variant-usage-v1";
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const AGENT_USAGE_SCHEMA_VERSION: u32 = 7;
 pub const AGENT_USAGE_MODE: &str = "local-token-usage";
 pub const AGENT_USAGE_TOKEN_SOURCE_MODE: &str = "native-metadata-first-incremental";
 pub const REPORT_COLLECTION: &str = "agent-usage-reports";
+/// Retained report count — an immutable local-data privacy limit, not an
+/// operator setting: the collection never grows past this bound.
 pub const MAX_REPORTS: usize = 20;
 pub const DEFAULT_USAGE_WINDOW_DAYS: u64 = 30;
 pub const MAX_USAGE_WINDOW_DAYS: u64 = 90;
 pub const UNATTRIBUTED_MODEL: &str = "Others";
+
+/// Cache-read counters a provider reports *outside* its base input count:
+/// they fold into the prompt and name the cached subset alike. Anthropic's
+/// `cache_read_input_tokens` sits here beside `cache_creation`, not inside
+/// the base. This is the single inventory every reader shares — attribution,
+/// normalization counting and additive-shape detection alike — so a
+/// recognized spelling can never be counted by one path and misread as
+/// non-additive by another.
+pub(crate) const ADDITIVE_CACHE_READ_FIELDS: &[&str] = &[
+    "cacheReadInputTokens",
+    "cache_read_input_tokens",
+    "cacheReadTokens",
+    "cache_read_tokens",
+    "cacheRead",
+    "cache_read",
+    "inputCacheRead",
+    "input_cache_read",
+];
+
+/// Cache-write and cache-creation counters a provider reports outside its
+/// base input count: they fold into the prompt.
+pub(crate) const ADDITIVE_CACHE_WRITE_FIELDS: &[&str] = &[
+    "cacheCreationInputTokens",
+    "cache_creation_input_tokens",
+    "cacheWriteInputTokens",
+    "cache_write_input_tokens",
+    "cacheWriteTokens",
+    "cache_write_tokens",
+    "cacheWrite",
+    "cache_write",
+    "inputCacheWriteTokens",
+    "input_cache_write_tokens",
+    "inputCacheCreation",
+    "input_cache_creation",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentDef {
@@ -92,13 +129,13 @@ impl HistoryUsageSummary {
 
     #[cfg(test)]
     pub fn to_json(&self) -> Value {
-        self.to_json_for_agent(None, &crate::registry::snapshot())
+        self.to_json_for_agent(None, &crate::registry::EmptyModelRegistry)
     }
 
     pub fn to_json_for_agent(
         &self,
         source_agent: Option<&str>,
-        registry: &crate::registry::RegistrySnapshot,
+        registry: &dyn crate::registry::ModelRegistry,
     ) -> Value {
         json!({
             "sessionCount": self.session_count,
@@ -252,7 +289,7 @@ impl HistoryUsageSummary {
     fn daily_usage_json(
         &self,
         source_agent: Option<&str>,
-        registry: &crate::registry::RegistrySnapshot,
+        registry: &dyn crate::registry::ModelRegistry,
     ) -> Vec<Value> {
         self.daily_usage
             .iter()
@@ -571,9 +608,44 @@ pub fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
 }
 
 pub fn number_field(value: &Value, keys: &[&str]) -> Option<u64> {
-    let object = value.as_object()?;
+    number_in(value.as_object()?, keys)
+}
+
+pub(crate) fn number_in(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| object.get(*key).and_then(number_value))
+}
+
+/// The reading of one logical counter across its alternative spellings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CounterReading {
+    /// No listed spelling is present in the record.
+    Absent,
+    /// A present spelling yielded a count.
+    Counted(u64),
+    /// A spelling was present but none yielded a count: the record named a
+    /// counter it never counted, which is unknown — never zero.
+    Uncounted,
+}
+
+/// Distinguishes a counter the record named but never counted (a `null`,
+/// non-numeric or negative value) from one it never named at all.
+pub(crate) fn counter_reading(object: &Map<String, Value>, keys: &[&str]) -> CounterReading {
+    let mut named = false;
+    for key in keys {
+        let Some(raw) = object.get(*key) else {
+            continue;
+        };
+        named = true;
+        if let Some(count) = number_value(raw) {
+            return CounterReading::Counted(count);
+        }
+    }
+    if named {
+        CounterReading::Uncounted
+    } else {
+        CounterReading::Absent
+    }
 }
 
 pub fn number_value(value: &Value) -> Option<u64> {

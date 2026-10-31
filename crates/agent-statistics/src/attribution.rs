@@ -1,6 +1,9 @@
 //! Metadata-first native-history token extraction and model attribution.
 
-use crate::contract::{HistoryUsageSummary, MessageUsage, UsageAccuracy, number_field, text_field};
+use crate::contract::{
+    ADDITIVE_CACHE_READ_FIELDS, ADDITIVE_CACHE_WRITE_FIELDS, CounterReading, HistoryUsageSummary,
+    MessageUsage, UsageAccuracy, counter_reading, number_in, text_field,
+};
 use crate::variant::{UsageVariant, model_label, prefer_recorded_model};
 use crate::window::UsageWindow;
 use serde_json::Value;
@@ -135,13 +138,51 @@ fn add_explicit_usage(
 
 pub fn message_usage(message: &Value, default_model: Option<String>) -> Option<MessageUsage> {
     let usage = message.get("usage")?;
-    let mut prompt_tokens = number_field(usage, &["promptTokens", "prompt_tokens"]).unwrap_or(0);
-    let mut completion_tokens =
-        number_field(usage, &["completionTokens", "completion_tokens"]).unwrap_or(0);
-    let field_total = prompt_tokens.saturating_add(completion_tokens);
-    let total_tokens = number_field(usage, &["totalTokens", "total_tokens"])
-        .filter(|value| *value > 0)
-        .unwrap_or(field_total);
+    let object = usage.as_object()?;
+    // A counter that folds into a reported total refuses the whole record
+    // when a spelling was named but never counted: folding it as absent
+    // would emit a precise partial total the record never wrote.
+    let counted = |keys: &[&str]| -> Option<u64> {
+        match counter_reading(object, keys) {
+            CounterReading::Counted(count) => Some(count),
+            CounterReading::Absent => Some(0),
+            CounterReading::Uncounted => None,
+        }
+    };
+    let base_prompt = counted(&[
+        "promptTokens",
+        "prompt_tokens",
+        "inputTokens",
+        "input_tokens",
+    ])?;
+    let cache_read = counted(ADDITIVE_CACHE_READ_FIELDS)?;
+    let cache_write = counted(ADDITIVE_CACHE_WRITE_FIELDS)?;
+    // A record carrying an additive cache spelling has an additive total:
+    // the categories sit outside the base count, so the reported total
+    // predates or excludes them and cannot reconcile the fields back down.
+    let additive = ADDITIVE_CACHE_READ_FIELDS
+        .iter()
+        .chain(ADDITIVE_CACHE_WRITE_FIELDS)
+        .any(|key| object.contains_key(*key));
+    // Additive categories fold through checked arithmetic: an overflow
+    // refuses the whole record rather than emitting a saturated count the
+    // record never wrote.
+    let mut prompt_tokens = base_prompt
+        .checked_add(cache_read)
+        .and_then(|prompt| prompt.checked_add(cache_write))?;
+    let mut completion_tokens = counted(&[
+        "completionTokens",
+        "completion_tokens",
+        "outputTokens",
+        "output_tokens",
+    ])?;
+    let field_total = prompt_tokens.checked_add(completion_tokens)?;
+    let total_tokens = match additive {
+        true => field_total,
+        false => number_in(object, &["totalTokens", "total_tokens"])
+            .filter(|value| *value > 0)
+            .unwrap_or(field_total),
+    };
     if field_total != total_tokens {
         if field_total > total_tokens {
             completion_tokens = completion_tokens.min(total_tokens);
@@ -159,19 +200,13 @@ pub fn message_usage(message: &Value, default_model: Option<String>) -> Option<M
     }
     let model =
         prefer_recorded_model(model_label(usage), message_model_label(message)).or(default_model);
+    // A subset inside the base count is capped by the base; the additive
+    // cache-read share joins it the way `normalize` folds the same fields.
+    let cached_subset = counted(&["cachedInputTokens", "cached_input_tokens"])?;
+    let cached_input = cached_subset.min(base_prompt).checked_add(cache_read)?;
     Some(MessageUsage {
         prompt_tokens,
-        cached_input_tokens: number_field(
-            usage,
-            &[
-                "cachedInputTokens",
-                "cached_input_tokens",
-                "cacheReadInputTokens",
-                "cache_read_input_tokens",
-            ],
-        )
-        .unwrap_or(0)
-        .min(prompt_tokens),
+        cached_input_tokens: cached_input.min(prompt_tokens),
         completion_tokens,
         total_tokens,
         model,
@@ -362,10 +397,33 @@ mod tests {
 
     #[test]
     fn explicit_usage_reconciles_totals_cache_and_model() {
+        // A reported total that disagrees with plain fields reconciles them
+        // down to it — no additive spelling is present to distrust it.
         let usage = message_usage(
             &json!({
                 "role": "agent",
                 "modelInfo": {"modelName": "default"},
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 110
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, 90);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 110);
+        assert_eq!(usage.model.as_deref(), Some("default"));
+
+        // An additive cache-read spelling marks the shape: the share sits
+        // outside the base count, so the prompt grows to 100 + 120 and the
+        // total derives from the parts — the reported 110 cannot reconcile
+        // categories it predates.
+        let usage = message_usage(
+            &json!({
+                "role": "agent",
                 "usage": {
                     "prompt_tokens": 100,
                     "cache_read_input_tokens": 120,
@@ -376,11 +434,84 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(usage.prompt_tokens, 90);
-        assert_eq!(usage.cached_input_tokens, 90);
+        assert_eq!(usage.prompt_tokens, 220);
+        assert_eq!(usage.cached_input_tokens, 120);
         assert_eq!(usage.completion_tokens, 20);
-        assert_eq!(usage.total_tokens, 110);
-        assert_eq!(usage.model.as_deref(), Some("default"));
+        assert_eq!(usage.total_tokens, 240);
+    }
+
+    #[test]
+    fn anthropic_cache_categories_are_additive_to_the_base_input() {
+        // The real Anthropic body: `input_tokens` excludes both cache
+        // categories, so they fold in — 10 + 30 + 5 — with the cache-read
+        // share as the cached subset, the same result the normalize path
+        // gives this shape.
+        let usage = message_usage(
+            &json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation_input_tokens": 5,
+                    "output_tokens": 8
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, 45);
+        assert_eq!(usage.cached_input_tokens, 30);
+        assert_eq!(usage.completion_tokens, 8);
+        assert_eq!(usage.total_tokens, 53);
+    }
+
+    #[test]
+    fn additive_overflow_refuses_the_record() {
+        // Every additive fold is checked: a count that cannot be expressed
+        // is no count at all, and saturating it would emit a number the
+        // record never wrote.
+        for usage in [
+            json!({"prompt_tokens": u64::MAX, "cache_read_input_tokens": 1}),
+            json!({"prompt_tokens": u64::MAX, "cache_creation_input_tokens": 1}),
+            json!({"prompt_tokens": u64::MAX, "completion_tokens": 1}),
+            json!({"prompt_tokens": u64::MAX, "cached_input_tokens": u64::MAX, "cache_read_input_tokens": 1}),
+        ] {
+            assert!(
+                message_usage(&json!({"usage": usage}), None).is_none(),
+                "an overflowing additive record is refused: {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_but_uncounted_counter_refuses_the_record() {
+        // `null` or non-numeric is not zero: the record named a counter it
+        // never counted, so folding it as absent would emit a precise
+        // partial total.
+        for usage in [
+            json!({"prompt_tokens": 100, "cache_read_input_tokens": null, "completion_tokens": 20, "total_tokens": 120}),
+            json!({"prompt_tokens": 100, "cache_creation_input_tokens": "n/a", "completion_tokens": 20}),
+            json!({"prompt_tokens": null, "completion_tokens": 20}),
+            json!({"prompt_tokens": 100, "completion_tokens": "unknown"}),
+            json!({"prompt_tokens": 100, "completion_tokens": 20, "cached_input_tokens": null}),
+        ] {
+            assert!(
+                message_usage(&json!({"usage": usage}), None).is_none(),
+                "a named-but-uncounted counter refuses the record: {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_uncounted_reconciliation_total_still_folds() {
+        // The reported total only reconciles counted constituents — it is
+        // never folded itself — so a named-but-uncounted total leaves the
+        // fold honest.
+        let usage = message_usage(
+            &json!({"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": null}}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(usage.total_tokens, 120);
     }
 
     #[test]

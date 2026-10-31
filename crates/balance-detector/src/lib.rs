@@ -41,7 +41,7 @@ pub use fact::{BalanceFact, QuotaWindow};
 pub use mapping::{BalanceMapping, CreditMapping, QuotaMapping};
 pub use source::BalanceSource;
 
-use licoup_extension_contracts::{ApplicationFailure, RecoveryAction};
+use token_usage_detector::{RecoveryAction, UsageFailure};
 
 /// The component every failure from this crate names.
 pub(crate) const COMPONENT: &str = "balance_detector";
@@ -50,12 +50,12 @@ pub(crate) const COMPONENT: &str = "balance_detector";
 pub(crate) const STAGE: &str = "balance-detector";
 
 /// A permanent refusal about the shape or the binding of an input.
-pub(crate) fn refusal(code: &str) -> ApplicationFailure {
-    ApplicationFailure::permanent(code, STAGE).with_component(COMPONENT)
+pub(crate) fn refusal(code: &str) -> UsageFailure {
+    UsageFailure::permanent(code, STAGE).with_component(COMPONENT)
 }
 
 /// A refusal whose next step is real for the caller.
 #[allow(dead_code)]
-pub(crate) fn refusal_with(code: &str, recovery: RecoveryAction) -> ApplicationFailure {
+pub(crate) fn refusal_with(code: &str, recovery: RecoveryAction) -> UsageFailure {
     refusal(code).with_recovery(recovery)
 }
