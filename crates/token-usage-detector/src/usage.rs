@@ -526,8 +526,9 @@ impl ExactNumber {
         self.mantissa < 0
     }
 
-    /// Exact subtraction, aligning scales without rounding.
-    pub fn checked_sub(self, other: Self) -> Option<Self> {
+    /// Both mantissas aligned to the finer of the two scales — the shared
+    /// base of the exact arithmetic below, which never rounds.
+    fn aligned(self, other: Self) -> Option<(i128, i128, u32)> {
         let scale = self.scale.max(other.scale);
         let left = self
             .mantissa
@@ -535,8 +536,24 @@ impl ExactNumber {
         let right = other
             .mantissa
             .checked_mul(10i128.checked_pow(scale - other.scale)?)?;
+        Some((left, right, scale))
+    }
+
+    /// Exact subtraction, aligning scales without rounding.
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
+        let (left, right, scale) = self.aligned(other)?;
         Some(Self {
             mantissa: left.checked_sub(right)?,
+            scale,
+        })
+    }
+
+    /// Exact addition, aligning scales without rounding. The published total
+    /// path: a sum is an amount, never a binary float.
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        let (left, right, scale) = self.aligned(other)?;
+        Some(Self {
+            mantissa: left.checked_add(right)?,
             scale,
         })
     }
@@ -594,6 +611,11 @@ mod tests {
             .checked_sub(ExactNumber::parse("1.00").expect("1.00"))
             .expect("difference");
         assert_eq!(delta.to_canonical_string(), "0.50");
+        let sum = ExactNumber::parse("0.1")
+            .expect("0.1")
+            .checked_add(ExactNumber::parse("0.03").expect("0.03"))
+            .expect("sum");
+        assert_eq!(sum.to_canonical_string(), "0.13");
         assert!(
             ExactNumber::parse("1e3").is_none(),
             "exponent forms are not amounts"

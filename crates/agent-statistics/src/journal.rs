@@ -588,7 +588,8 @@ impl UsageJournal {
             };
             total = Some(match total {
                 None => value,
-                Some(previous) => checked_sum(previous, value)
+                Some(previous) => previous
+                    .checked_add(value)
                     .ok_or_else(|| LedgerError::refused(STAGE, "usage_journal_decimal_overflow"))?,
             });
         }
@@ -1625,20 +1626,6 @@ fn stored_cursor(
                     .map_err(|_| LedgerError::refused(STAGE, "usage_journal_cursor_invalid"))?,
             })),
         })
-}
-
-/// Exact addition over the published decimal.
-///
-/// The contract publishes exact subtraction — `0.1` and `0.3` have no exact
-/// binary form, so a total is never a float — and an addition through it is a
-/// subtraction of the negation, which rounds nothing.
-fn checked_sum(previous: ExactNumber, value: ExactNumber) -> Option<ExactNumber> {
-    let canonical = value.to_canonical_string();
-    let negated = match canonical.strip_prefix('-') {
-        Some(magnitude) => magnitude.to_owned(),
-        None => format!("-{canonical}"),
-    };
-    previous.checked_sub(ExactNumber::parse(&negated)?)
 }
 
 fn quality_id(quality: Quality) -> &'static str {

@@ -13,6 +13,8 @@ and the journal engine that measures and keeps them.
 The detector crates are boundary layers: they open no connections, store no
 ledgers and compute no charges. Provider-specific acquisition lives in
 adapters; `agent-statistics` is the accounting side the host composes.
+`balance-detector` builds on `token-usage-detector` — the usage vocabulary is
+the shared base, and the dependency never runs the other way.
 
 `token-usage-detector::agent` owns raw Agent token counters, alias parsing and
 nested OpenCode token mapping; `token-usage-detector::provider` maps the

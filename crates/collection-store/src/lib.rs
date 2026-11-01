@@ -11,12 +11,10 @@
 //! appends usage reports can therefore bound both count and bytes while never
 //! publishing a half-record.
 //!
-//! This crate is the shared store the workspace's consumers are migrating to:
-//! `agent-statistics` persists retained reports and gateway counters through
-//! it and drops the older `licoup-client-state` dependency in the same
-//! change. Until that lands the crate is introduced here on its own —
-//! published and verified independently, adopted by its consumers next, so
-//! the boundary is the crate itself rather than a second copy of the logic.
+//! This crate is the single implementation `agent-statistics` stores
+//! through: retained reports persist as bounded collection documents, and
+//! the gateway request counters write through the private-file rules in
+//! [`fs`] — owner-only directories, atomic writes, bounded reads.
 
 pub mod fs;
 

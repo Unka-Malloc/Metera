@@ -252,18 +252,6 @@ fn observed_instant(observed_at: &str) -> i128 {
         .unwrap_or(i128::MIN)
 }
 
-/// Exact addition over the published decimal, through the same negated
-/// subtraction the journal uses: `0.1` has no exact binary form and a total
-/// is never a float.
-fn add_exact(left: ExactNumber, right: ExactNumber) -> Option<ExactNumber> {
-    let canonical = right.to_canonical_string();
-    let negated = match canonical.strip_prefix('-') {
-        Some(magnitude) => magnitude.to_owned(),
-        None => format!("-{canonical}"),
-    };
-    left.checked_sub(ExactNumber::parse(&negated)?)
-}
-
 /// Escape one label value for the exposition format: backslash, quote and
 /// newline are the only characters the grammar cannot carry.
 fn escape_label(value: &str) -> String {
@@ -428,7 +416,7 @@ fn write_token_families(out: &mut String, rows: &[TokenRow]) -> bool {
                 *unknown.entry(key).or_default() += 1;
             } else if let Some(value) = *value {
                 match totals.remove(&key) {
-                    Some(total) => match add_exact(total, value) {
+                    Some(total) => match total.checked_add(value) {
                         Some(sum) => {
                             totals.insert(key, sum);
                         }

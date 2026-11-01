@@ -1,41 +1,63 @@
 # Releasing the workspace
 
-The four crates are published dependency-first. A version bump is not a
-release: the upload waits for the release owner's signing/unlock authorization.
+Releases run on the generated release train under `.github/workflows/`:
+`verify.yml` selects, verifies and packages a candidate; `publish.yml`
+holds the only job trusted with the crates.io OIDC identity. Both files are
+generated from the release declaration recorded in `.github/release.lock` —
+regenerate them instead of editing by hand.
 
-## Publishing order
+## The two workflows
 
-| Order | Crate | Wave version | Internal dependencies |
-| --- | --- | --- | --- |
-| 1 | `collection-store` | 0.1.0 | none |
-| 2 | `token-usage-detector` | 0.2.1 | none |
-| 3 | `balance-detector` | 0.2.0 | `token-usage-detector` |
-| 4 | `agent-statistics` | 0.2.0 | `collection-store`, `token-usage-detector` |
+- **`verify.yml` — the verify train.** Every Friday it rehearses a release
+  of the last commit merged into `nightly` before the 23:59 UTC+08:00
+  cutoff, bumping by the highest `release:patch|minor|major` label among
+  the candidate's pull requests (patch when none is set). A manual dispatch
+  releases the head of `nightly` — or the `candidate` input's commit — at
+  the exact `version` input or at a `level` bump; `rehearse: true` runs the
+  whole pipeline as a dry-run with nothing pushed, tagged or uploaded.
+  Either way the job runs `scripts/verify.sh`, computes the release
+  version, packages the set and hands the release inputs over as an
+  artifact.
+- **`publish.yml` — the release side.** It runs the default branch's own
+  copy after a `verify` run completes, so a candidate ref can never supply
+  the workflow that receives the publishing identity. Its gate binds the
+  run to a succeeded `verify.yml` execution on the default branch and
+  derives live/dry-run from GitHub-minted metadata: a scheduled train keeps
+  its rehearsal mode, a dispatched verify publishes only when it was not a
+  rehearsal, and dispatching `publish.yml` itself with a `run_id` is the
+  operator's proven intent to publish. The release job recomputes the
+  version decision from the bound commit, bumps the workspace, promotes it
+  to `stable`, uploads the crates in dependency-first order through
+  crates.io Trusted Publishing — no stored secret — then tags `v<next>`,
+  moves `release` and merges the tag back into `nightly`.
 
-Internal dependencies are declared as `{ path = "…", version = "…" }` in the
-workspace manifest. Cargo removes the path when packaging, so the published
-requirement is the version shown above.
+A candidate identical to the last published release is skipped; a rerun
+after a partial upload finishes the same version instead of skipping past
+it.
 
-## Four release self-checks
+## Versions and order
 
-1. **Workspace verification** — `./scripts/verify.sh` runs formatting, clippy
-   with warnings denied, and the whole workspace test suite.
-2. **Dependency closure** — no `licoup-*`, git, or unversioned path
-   dependencies remain; every internal dependency version matches its
-   package version; the publish order above is still acyclic.
-3. **Package surface** — `cargo package --list` contains the intended files,
-   and `cargo publish --dry-run` verifies the package that would be uploaded.
-   Downstream crates cannot resolve an unpublished internal version from
-   crates.io; verify them against a local source replacement holding the
-   already-packaged upstream crates.
-4. **Consumer smoke** — a project that depends on the four released versions
-   compiles using only the packaged crates. This proves that
-   `agent-statistics` consumes the released `collection-store` version and
-   that the dependency closure is complete.
+Crate versions and their internal dependency pins live in the manifests —
+[`../Cargo.toml`](../Cargo.toml) for the workspace requirements and each
+`crates/*/Cargo.toml` for package versions — which both workflows read
+through `cargo metadata`. The publish order is recomputed there rather
+than restated here: `collection-store` and `token-usage-detector` have no
+internal dependencies, `balance-detector` builds on
+`token-usage-detector`, and `agent-statistics` comes last.
 
-## Authorization gate
+## Manual checks (fallback)
 
-Checks 3 and 4 can be completed locally, but uploading to crates.io is an
-irreversible external action. Run the checks first, then request the release
-owner's signing/unlock authorization. Never publish from a dirty working tree
-without an explicit release instruction.
+When the train itself is unavailable the same gates still run locally:
+
+1. `./scripts/verify.sh` — formatting, clippy with warnings denied, the
+   whole workspace test suite.
+2. Dependency closure — no git or unversioned path dependencies remain and
+   every internal `version = "…"` matches its package version.
+3. `cargo package --list` and `cargo publish --dry-run` — the packaged
+   surface is the intended one; downstream crates verify against a local
+   source replacement holding the already-packaged upstream crates.
+4. A consumer project depending on the released versions compiles — proof
+   that `agent-statistics` resolves the published `collection-store`.
+
+Local checks prove the candidate; uploading stays with the train's OIDC
+identity and never runs from a local checkout.

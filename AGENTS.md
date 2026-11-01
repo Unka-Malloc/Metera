@@ -9,7 +9,9 @@ Two detector crates, one boundary rule each way:
   its own source, epoch, scope or measurement.
 - `balance-detector` — maps provider account responses into bound credit and
   subscription-quota facts (weekly/monthly remaining share). A payload never
-  names the account it describes.
+  names the account it describes. It builds on `token-usage-detector`, which
+  owns the shared refusal vocabulary (`UsageFailure`, `RecoveryAction`) and
+  name helpers; the dependency never runs the other way.
 
 Both crates are the boundary layer, not clients: no network connections, no
 ledgers, no charges. Provider-specific acquisition lives in adapters above;
