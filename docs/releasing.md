@@ -9,31 +9,59 @@ regenerate them instead of editing by hand.
 ## The two workflows
 
 - **`verify.yml` — the verify train.** Every Friday it rehearses a release
-  of the last commit merged into `nightly` before the 23:59 UTC+08:00
-  cutoff, bumping by the highest `release:patch|minor|major` label among
-  the candidate's pull requests (patch when none is set). A manual dispatch
-  releases the head of `nightly` — or the `candidate` input's commit — at
-  the exact `version` input or at a `level` bump; `rehearse: true` runs the
-  whole pipeline as a dry-run with nothing pushed, tagged or uploaded.
+  of the last commit merged into the default branch before the 23:59
+  UTC+08:00 cutoff, bumping by the highest `release:patch|minor|major`
+  label among the candidate's pull requests (patch when none is set). A
+  manual dispatch releases the head of the default branch — or the
+  `candidate` input's commit — at the exact `version` input or at a
+  `level` bump; `rehearse: true` runs the whole pipeline as a dry-run with
+  nothing pushed, tagged or uploaded.
   Either way the job runs `scripts/verify.sh`, computes the release
   version, packages the set and hands the release inputs over as an
   artifact.
-- **`publish.yml` — the release side.** It runs the default branch's own
-  copy after a `verify` run completes, so a candidate ref can never supply
-  the workflow that receives the publishing identity. Its gate binds the
-  run to a succeeded `verify.yml` execution on the default branch and
-  derives live/dry-run from GitHub-minted metadata: a scheduled train keeps
-  its rehearsal mode, a dispatched verify publishes only when it was not a
-  rehearsal, and dispatching `publish.yml` itself with a `run_id` is the
-  operator's proven intent to publish. The release job recomputes the
-  version decision from the bound commit, bumps the workspace, promotes it
-  to `stable`, uploads the crates in dependency-first order through
-  crates.io Trusted Publishing — no stored secret — then tags `v<next>`,
-  moves `release` and merges the tag back into `nightly`.
+- **`publish.yml` — the release side.** `workflow_run` on the completed
+  `verify` train is its only trigger — there is deliberately no
+  `workflow_dispatch` and no tag path on the OIDC file — so the workflow
+  that executes under the publishing identity is always the default
+  branch's own copy. Its gate binds the run to a succeeded `verify.yml`
+  execution on the default branch and derives live/dry-run and the
+  release kind from metadata GitHub minted — the run's event and the
+  signed verify job name (`sig=1`/`sched=`/`rehearse`/`version`/`level`/
+  `cand=`), never from the `release-inputs` artifact, whose only fields
+  are `sha` and `release`. The release job runs in the `release`
+  environment, recomputes the version decision from the bound commit,
+  bumps the workspace, promotes it to `stable`, uploads the crates in
+  dependency-first order through crates.io Trusted Publishing — no stored
+  secret — then tags `v<next>`, moves `release` and merges the tag back
+  into the bound source branch.
 
 A candidate identical to the last published release is skipped; a rerun
 after a partial upload finishes the same version instead of skipping past
 it.
+
+## Releasing manually
+
+Dispatch `verify.yml` on the default branch with `rehearse: false`,
+optionally naming `version`, `level` or `candidate`. A live
+(non-rehearsal) run flows into `publish.yml` and still meets the
+`release` environment's approval; a scheduled train stays a rehearsal
+and never publishes. There is no `run_id` input and no way to dispatch
+`publish.yml` directly — the operator's proven intent to publish is the
+verify dispatch plus the environment approval.
+
+## One-time infrastructure
+
+Two settings live outside the generated files and are created once per
+repository:
+
+- A `release` environment with required reviewers and a
+  deployment-branch rule allowing only the default branch. The
+  environment — not the in-file ref check, which stays as a second
+  lock — is what confines a dispatch's reach.
+- crates.io Trusted Publishing for each published crate bound to that
+  `release` environment and to `publish.yml` as the workflow filename —
+  registries mint the OIDC token for that file, which is why the
+  publishing job lives there and not in `verify.yml`.
 
 ## Versions and order
 
