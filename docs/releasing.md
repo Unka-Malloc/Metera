@@ -61,7 +61,12 @@ repository:
 - crates.io Trusted Publishing for each published crate bound to that
   `release` environment and to `publish.yml` as the workflow filename —
   registries mint the OIDC token for that file, which is why the
-  publishing job lives there and not in `verify.yml`.
+  publishing job lives there and not in `verify.yml`. No stored
+  publishing credential exists; the only optional secret is
+  `RELEASE_ENV_READ_TOKEN`, a read-scoped token the environment
+  preflight step falls back to when `github.token` cannot read
+  `/environments` — without it an unreadable answer simply counts as
+  'unverified' rather than blocked.
 
 ## Versions and order
 
