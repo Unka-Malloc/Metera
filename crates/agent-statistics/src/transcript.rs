@@ -46,12 +46,6 @@ pub fn transcript_binding(
     .context("transcript source binding")
 }
 
-/// Collect one session's declared counters into the journal.
-///
-/// The epoch and scope inside each payload are the admission's own: the
-/// payload carries what the host bound, never a second opinion about who
-/// produced it. Payloads publish in bounded chunks — a long session
-/// settles as several `usage.publish` batches, not one oversized frame.
 /// The settled ingest plus the store defects the read observed.
 #[derive(Debug)]
 pub struct TranscriptReport {
@@ -69,11 +63,12 @@ pub struct TranscriptReport {
 ///
 /// The epoch and scope inside each payload are the admission's own: the
 /// payload carries what the host bound, never a second opinion about who
-/// produced it. Payloads publish in bounded chunks — a long session
-/// settles as several `usage.publish` batches, not one oversized frame.
-/// `skipped_lines` stays visible to the caller: undecodable store lines
-/// are the store's defect, and silently swallowing them would read as
-/// "no usage".
+/// produced it. The read streams publish-sized batches and each batch
+/// commits in its own bounded transaction (`publish_all`) — a long
+/// session never pins the WAL for its whole read. `skipped_lines` and
+/// `truncated` stay visible to the caller: undecodable store lines are
+/// the store's defect, and a session past the byte ceiling settles its
+/// prefix, never a silent "no usage".
 pub fn collect_transcript_session(
     host: &mut UsageSourceHost,
     admission: &SourceAdmission,
@@ -93,10 +88,19 @@ pub fn collect_transcript_session(
         )
         .map(|batch| {
             batch
-                .map_err(|_| LedgerError::refused("acop.transcript", "transcript_read_failed"))
+                .map_err(|error| LedgerError {
+                    code: "transcript_read_failed".into(),
+                    stage: "acop.transcript".into(),
+                    // A store read can fail transiently like any storage
+                    // call — retryable, with the codec's own error (path
+                    // and cause) kept on the report.
+                    retryable: true,
+                    recovery: format!("{error}"),
+                })
                 .and_then(|observations| {
-                    PublishBatch::new(observations)
-                        .map_err(|_| LedgerError::refused("acop.transcript", "batch_refused"))
+                    PublishBatch::new(observations).map_err(|_| {
+                        LedgerError::refused("acop.transcript", "transcript_batch_invalid")
+                    })
                 })
         });
     let ingest = host

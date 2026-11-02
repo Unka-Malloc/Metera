@@ -41,7 +41,9 @@ use token_usage_detector::UsageFailure;
 use token_usage_detector::binding::{
     BatchRefusal, BoundObservation, BoundObservationKey, SourceBinding,
 };
-use token_usage_detector::collection::{Cursor, PublishBatch, QueryPage, QueryRequest};
+use token_usage_detector::collection::{
+    Cursor, MAX_BATCH_OBSERVATIONS, PublishBatch, QueryPage, QueryRequest,
+};
 use token_usage_detector::metrics as general;
 use token_usage_detector::names::is_namespaced;
 use token_usage_detector::usage::{ExactNumber, Quality, UsageObservation, UsageOperation};
@@ -571,83 +573,74 @@ impl UsageJournal {
         Ok(())
     }
 
-    /// Settle a lazily-produced sequence of publish batches inside one
-    /// transaction: a session's observations commit once no matter how
-    /// many bounded batches its read produced. Batches pull in as the
-    /// transaction needs them — peak memory stays one batch — and a pull
-    /// or settlement failure drops the transaction with nothing
-    /// committed. Refused indexes count across the flattened delivery.
+    /// Settle a lazily-produced sequence of publish batches at a bounded
+    /// commit cadence: every `PublishBatch` commits in its own
+    /// transaction the way `usage.publish` does, so a session-sized
+    /// stream never pins the WAL or the writer lock for its whole read.
+    /// Batches pull in as needed — peak memory stays one batch — and a
+    /// pull or storage failure stops the sequence with every earlier
+    /// batch already durable. Refused indexes count across the flattened
+    /// delivery; `events` keeps the leading batch's settlements, since a
+    /// session's full event list is unbounded.
     pub fn publish_all(
         &mut self,
         admission: &SourceAdmission,
         batches: impl IntoIterator<Item = LedgerResult<PublishBatch>>,
     ) -> LedgerResult<IngestReport> {
-        self.maybe_sweep_retention()?;
-        let transaction = self
-            .ledger
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| LedgerError::storage())?;
-        let mut refused = Vec::new();
-        let mut events = Vec::new();
-        let mut accepted = 0usize;
+        let mut merged = IngestReport {
+            source_ref: admission.binding.source_ref.clone(),
+            accepted: 0,
+            refused: Vec::new(),
+            events: Vec::new(),
+            cursor: None,
+        };
         let mut flat_index = 0usize;
         for batch in batches {
             let batch = batch?;
-            for value in batch.observations() {
-                flat_index += 1;
-                match admission.binding.bind_value(value.clone(), None) {
-                    Err(failure) => refused.push(BatchRefusal {
-                        index: flat_index - 1,
-                        failure,
-                    }),
-                    Ok(bound) => match settle_event(&transaction, admission, &bound) {
-                        Ok(settlement) => {
-                            accepted += 1;
-                            events.push(settlement);
-                        }
-                        Err(error) if error.retryable => return Err(error),
-                        Err(error) => refused.push(BatchRefusal {
-                            index: flat_index - 1,
-                            failure: failure_from(error),
-                        }),
-                    },
-                }
+            flat_index += batch.observations().len();
+            let report = UsageSourcePort::publish(self, admission, &batch)?;
+            merged.accepted += report.accepted;
+            for mut refusal in report.refused {
+                refusal.index += flat_index - batch.observations().len();
+                merged.refused.push(refusal);
             }
+            let spare = MAX_BATCH_OBSERVATIONS.saturating_sub(merged.events.len());
+            merged.events.extend(report.events.into_iter().take(spare));
+            merged.cursor = report.cursor;
         }
-        let cursor = stored_cursor(
-            &transaction,
-            &admission.binding.source_ref,
-            &admission.binding.source_epoch,
-        )?
-        .map(|stored| stored.cursor);
-        transaction.commit().map_err(|_| LedgerError::storage())?;
-        Ok(IngestReport {
-            source_ref: admission.binding.source_ref.clone(),
-            accepted,
-            refused,
-            events,
-            cursor,
-        })
+        Ok(merged)
     }
 
-    /// The newest and oldest served fact instants inside the retention
-    /// horizon. Expositions cache against the pair: the max moves when
-    /// settlement or retraction writes, the min moves when the oldest
-    /// served row crosses the horizon — so a cached text can never keep
-    /// answering for a fact the retention bound just retired.
+    /// The newest written and oldest served fact instants — two index
+    /// seeks, not a scan. The max covers every row including retracted
+    /// ones (a retraction bumps `updated_at_ms`, so a withdrawal always
+    /// moves the key); the min covers only the served, in-horizon rows,
+    /// so the oldest fact crossing the retention bound moves it too. A
+    /// cached exposition can never keep answering for a fact that left
+    /// the served set.
     pub fn facts_watermark(&self) -> LedgerResult<(i64, i64)> {
         self.maybe_sweep_retention()?;
         let cutoff = now_ms() - USAGE_JOURNAL_RETENTION_MS;
-        self.ledger
+        let max = self
+            .ledger
             .connection
             .query_row(
-                "SELECT COALESCE(MAX(updated_at_ms),0), COALESCE(MIN(updated_at_ms),0)
-                 FROM usage_source_facts WHERE retracted=0 AND updated_at_ms>=?1",
-                params![cutoff],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT COALESCE(MAX(updated_at_ms),0) FROM usage_source_facts",
+                [],
+                |row| row.get(0),
             )
-            .map_err(|_| LedgerError::storage())
+            .map_err(|_| LedgerError::storage())?;
+        let min = self
+            .ledger
+            .connection
+            .query_row(
+                "SELECT COALESCE(MIN(updated_at_ms),0) FROM usage_source_facts
+                 WHERE retracted=0 AND updated_at_ms>=?1",
+                params![cutoff],
+                |row| row.get(0),
+            )
+            .map_err(|_| LedgerError::storage())?;
+        Ok((max, min))
     }
 
     /// The exact total of one scope and metric over the facts that may settle.

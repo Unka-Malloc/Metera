@@ -211,7 +211,6 @@ impl FactProjection {
             *self.unknown.entry(key).or_default() += 1;
             return;
         }
-        *self.counted.entry(key.clone()).or_default() += 1;
         if self.tainted.contains(&key) {
             *self.unknown.entry(key).or_default() += 1;
             return;
@@ -225,9 +224,13 @@ impl FactProjection {
             *self.unknown.entry(key).or_default() += 1;
             return;
         };
+        // `counted` tracks readings that actually summed into the series
+        // total — not merely ones carrying a value — so a tainted key's
+        // withdrawn share stays enumerable under a folded merge.
         match self.totals.remove(&key) {
             Some(total) => match total.checked_add(value) {
                 Some(sum) => {
+                    *self.counted.entry(key.clone()).or_default() += 1;
                     self.totals.insert(key, sum);
                 }
                 None => {
@@ -236,6 +239,7 @@ impl FactProjection {
                 }
             },
             None => {
+                *self.counted.entry(key.clone()).or_default() += 1;
                 self.totals.insert(key, value);
             }
         }
@@ -466,10 +470,11 @@ fn write_token_families(out: &mut String, projection: &FactProjection) -> bool {
     // reading the merged total carried lands under unknown instead of
     // vanishing with the dropped total.
     let mut merged_counted: BTreeMap<TokenKey, u64> = BTreeMap::new();
+    for (key, count) in &projection.counted {
+        *merged_counted.entry(remap(key)).or_default() += count;
+    }
     for (key, total) in &projection.totals {
         let merged = remap(key);
-        *merged_counted.entry(merged.clone()).or_default() +=
-            projection.counted.get(key).copied().unwrap_or(0);
         if tainted.contains(&merged) {
             continue;
         }
@@ -930,7 +935,7 @@ metera_usage_unknown_facts{kind=\"total\",model=\"kimi-k2\",source=\"native:code
         );
         assert!(
             text.contains(
-                "metera_usage_unknown_facts{kind=\"input\",model=\"m\",source=\"native:a\"} 1"
+                "metera_usage_unknown_facts{kind=\"input\",model=\"m\",source=\"native:a\"} 2"
             ),
             "the unsumable series reports under unknown facts: {text}"
         );
@@ -1096,5 +1101,53 @@ metera_usage_unknown_facts{kind=\"total\",model=\"kimi-k2\",source=\"native:code
         ));
         assert!(text.contains("metera_gateway_agent_requests_total"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A merged `Other` series that a pre-tainted raw key reaches keeps
+    /// honesty: every counted reading under the merge lands in
+    /// metera_usage_unknown_facts instead of publishing a folded total
+    /// that silently lost the tainted share — and no token series exists
+    /// for the merged key at all.
+    #[test]
+    fn a_folded_merge_carries_its_counted_readings_into_unknown() {
+        let mut projection = FactProjection::default();
+        let key = |model: &str| {
+            (
+                "native:test".to_owned(),
+                model.to_owned(),
+                "input".to_owned(),
+            )
+        };
+        for index in 0..MAX_MODELS_PER_DAY {
+            let model = format!("m{index:02}");
+            projection.models.insert(model.clone());
+            projection
+                .totals
+                .insert(key(&model), ExactNumber::parse("1").expect("exact"));
+            projection.counted.insert(key(&model), 1);
+        }
+        // Two models past the fold bound: `za` taints the merged key (an
+        // overflowing or unparseable reading withdrew its total), `zb`
+        // brings counted readings that must not vanish with it.
+        projection.models.insert("za".to_owned());
+        projection.tainted.insert(key("za"));
+        projection.counted.insert(key("za"), 1);
+        projection.models.insert("zb".to_owned());
+        projection
+            .totals
+            .insert(key("zb"), ExactNumber::parse("8").expect("exact"));
+        projection.counted.insert(key("zb"), 2);
+
+        let mut text = String::new();
+        write_token_families(&mut text, &projection);
+        assert!(
+            !text.contains("metera_usage_tokens{kind=\"input\",model=\"Other\""),
+            "the tainted merge emits no token total"
+        );
+        // za's one counted reading plus zb's two land under the merged
+        // unknown count — nothing counted is silently dropped.
+        assert!(text.contains(
+            "metera_usage_unknown_facts{kind=\"input\",model=\"Other\",source=\"native:test\"} 3"
+        ));
     }
 }

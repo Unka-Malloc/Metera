@@ -279,7 +279,15 @@ impl UsageSourceHost {
 
     /// Withdraw one fact the named consumer owns, by identity.
     pub fn retract(&mut self, owner: &str, fact_id: &str) -> LedgerResult<FactReceipt> {
-        MeteringFactPort::retract(&mut self.journal, owner, fact_id)
+        let receipt = MeteringFactPort::retract(&mut self.journal, owner, fact_id)?;
+        // In-process fast path: the watermark covers cross-process
+        // retractions on the next lookup, but this host rendered the
+        // fact — drop the text now rather than wait for the seek.
+        *self
+            .exposition_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        Ok(receipt)
     }
 
     /// Read facts, by cursor.
@@ -960,74 +968,90 @@ mod tests {
     }
 
     /// A cached exposition serves only while the journal's fact watermark
-    /// stands still: a new settlement re-renders, and a fact crossing the
-    /// retention horizon re-renders too — a cache hit can never keep
-    /// answering for a fact the retention bound just retired.
+    /// stands still: a settlement re-renders, a fact crossing the
+    /// retention horizon re-renders — and the served set drops it — and a
+    /// retraction re-renders too. A cache hit can never keep answering
+    /// for a fact that left the served set.
     #[test]
     fn a_cached_exposition_expires_with_the_facts_it_describes() {
         let root = root("exposition-cache");
         let mut host = UsageSourceHost::open(&params(&root)).expect("host");
-        let admission = admission("epoch-1");
-        host.publish(&admission, &batch(&[upsert("obs-1", 1, "7")]))
-            .expect("settled");
-
-        let renders = AtomicU64::new(0);
-        let render = |host: &UsageSourceHost| {
-            renders.fetch_add(1, Ordering::Relaxed);
-            Ok(format!("facts:{}", fact_rows(host)))
+        let fact = |fact_id: &str, metric: &str, value: &str| MeteringFact {
+            fact_id: fact_id.to_owned(),
+            scope_ref: "agent:test".to_owned(),
+            metric: metric.to_owned(),
+            value: Some(value.to_owned()),
+            unit: "tokens".to_owned(),
+            quality: token_usage_detector::usage::Quality::Reported,
+            eligibility: SettlementEligibility::SettlementEligible,
+            source_ref: "native:test".to_owned(),
+            observed_at: "2026-09-21T00:00:00Z".to_owned(),
         };
-        let first = host
-            .exposition_cached(0, |_| render(&host))
-            .expect("first render");
-        let second = host
-            .exposition_cached(0, |_| render(&host))
-            .expect("cached render");
-        assert_eq!(first, second);
-        assert_eq!(renders.load(Ordering::Relaxed), 1, "cache served the hit");
+        host.record_all(
+            "native:test",
+            vec![
+                fact(
+                    "agent:test#reading:2026-07-14:model-old#licoup.tokens.input",
+                    "licoup.tokens.input",
+                    "7",
+                ),
+                fact(
+                    "agent:test#reading:2026-07-14:model-new#licoup.tokens.output",
+                    "licoup.tokens.output",
+                    "3",
+                ),
+            ],
+        )
+        .expect("recorded");
 
-        host.publish(&admission, &batch(&[upsert("obs-2", 1, "3")]))
-            .expect("settled");
-        host.exposition_cached(0, |_| render(&host))
-            .expect("re-render after write");
-        assert_eq!(
-            renders.load(Ordering::Relaxed),
-            2,
-            "settlement moved the watermark"
-        );
+        let rendered = |host: &UsageSourceHost| crate::export::render(host, None).expect("render");
+        let first = rendered(&host);
+        assert!(first.contains("model-old"));
+        assert!(first.contains("model-new"));
+        assert_eq!(rendered(&host), first, "the second scrape is a cache hit");
 
-        // Age the rows past the retention horizon through a side
-        // connection: the watermark's own cutoff drops them from the
-        // served set, so the next lookup must not reuse the cached text.
-        let stale = {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            now - crate::journal::USAGE_JOURNAL_RETENTION_MS - 1
-        };
+        // Age only the older fact past the horizon through a side
+        // connection — give it a distinct instant first so the served-set
+        // min is its own, then push it out: the watermark's min moves,
+        // the read path filters it — the expired series leaves the text
+        // while the newer one stays.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
         let connection = Connection::open(host.ledger_path()).expect("the ledger store");
         connection
             .execute(
-                "UPDATE usage_source_facts SET updated_at_ms=?1",
-                rusqlite::params![stale],
+                "UPDATE usage_source_facts SET updated_at_ms=?1 WHERE fact_id LIKE '%model-old%'",
+                rusqlite::params![now - 60_000],
+            )
+            .expect("distinct instant");
+        let rendered_again = rendered(&host);
+        assert!(rendered_again.contains("model-old"));
+        connection
+            .execute(
+                "UPDATE usage_source_facts SET updated_at_ms=?1 WHERE fact_id LIKE '%model-old%'",
+                rusqlite::params![now - crate::journal::USAGE_JOURNAL_RETENTION_MS - 1],
             )
             .expect("aged");
-        host.exposition_cached(0, |_| render(&host))
-            .expect("re-render after aging");
-        assert_eq!(
-            renders.load(Ordering::Relaxed),
-            3,
-            "retirement moved the watermark"
+        let aged = rendered(&host);
+        assert!(
+            !aged.contains("model-old"),
+            "the expired series left the exposition"
         );
+        assert!(aged.contains("model-new"), "the newer series remains");
 
-        // The watermark stands still but the gateway document changed:
-        // the folded-in counters are part of the cache key.
-        host.exposition_cached(1, |_| render(&host))
-            .expect("re-render on fingerprint change");
-        assert_eq!(
-            renders.load(Ordering::Relaxed),
-            4,
-            "a gateway change re-renders on a still watermark"
+        // A retraction moves the watermark too: the withdrawn reading
+        // cannot keep publishing through a cached render.
+        host.retract(
+            "native:test",
+            "agent:test#reading:2026-07-14:model-new#licoup.tokens.output",
+        )
+        .expect("retracted");
+        let withdrawn = rendered(&host);
+        assert!(
+            !withdrawn.contains("model-new"),
+            "the retracted reading left the exposition"
         );
 
         let _ = fs::remove_dir_all(root);

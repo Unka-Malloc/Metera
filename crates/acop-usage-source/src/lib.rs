@@ -20,6 +20,7 @@
 
 use acop::{Codec, SessionEntry, StoreScan, TranscriptUsage, UsageTemporality, store};
 use serde_json::{Value, json};
+use std::io::BufRead;
 use std::path::Path;
 use token_usage_detector::metrics;
 use token_usage_detector::usage::wire;
@@ -114,12 +115,24 @@ const MAX_BATCH_OBSERVATIONS: usize = token_usage_detector::collection::MAX_BATC
 enum BatchState {
     Decoded(std::vec::IntoIter<Value>),
     Lines {
-        lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
+        reader: std::io::BufReader<std::fs::File>,
         bytes: u64,
-        produced: usize,
+        line_no: usize,
         pending: Vec<Value>,
     },
     Failed(Option<acop::Error>),
+}
+
+/// What one store line projects to under the spec.
+enum LineProjection {
+    /// Whitespace or empty — not a record at all.
+    Empty,
+    /// Undecodable — a store defect the read reports as skipped.
+    Malformed,
+    /// Decodable but carries none of the declared counters.
+    NoCounters,
+    /// A settled usage payload.
+    Payload(Value),
 }
 
 impl<'a> TranscriptSource<'a> {
@@ -167,13 +180,15 @@ impl<'a> TranscriptSource<'a> {
 
     /// Stream one session's payloads in publish-sized batches.
     ///
-    /// The session is never materialized: a file streams through a
-    /// buffered reader and each batch carries at most
-    /// [`MAX_BATCH_OBSERVATIONS`] payloads, so peak memory is one batch
-    /// plus one line. Bytes past [`MAX_SESSION_BYTES`] stop the read and
-    /// mark `stats.truncated` — a huge store settles its prefix rather
-    /// than exhausting the host's memory. `stats` reports skipped lines
-    /// and truncation as they happen.
+    /// A file-backed session is never materialized: it streams through a
+    /// buffered reader bounded to `byte_ceiling` total bytes, every line
+    /// is read with the remaining budget (a line the budget cuts mid-way
+    /// settles nothing and marks the prefix truncated), and each batch
+    /// carries at most [`MAX_BATCH_OBSERVATIONS`] payloads — peak memory
+    /// is one batch plus one budgeted line. A container session is
+    /// different: `decode_session` materializes the canonical
+    /// conversation by contract, so its bound is the codec's own.
+    /// `stats` reports skipped lines and truncation as they happen.
     pub fn payload_batches(
         &'a self,
         entry: &'a SessionEntry,
@@ -216,9 +231,9 @@ impl<'a> TranscriptSource<'a> {
         } else {
             match std::fs::File::open(&entry.session.path) {
                 Ok(file) => BatchState::Lines {
-                    lines: std::io::BufRead::lines(std::io::BufReader::new(file)),
+                    reader: std::io::BufReader::new(file),
                     bytes: 0,
-                    produced: 0,
+                    line_no: 0,
                     pending: Vec::new(),
                 },
                 Err(error) => BatchState::Failed(Some(acop::Error::io(&entry.session.path)(error))),
@@ -226,6 +241,10 @@ impl<'a> TranscriptSource<'a> {
         };
         let session_id = &entry.session.id;
         std::iter::from_fn(move || {
+            let flush = |pending: &mut Vec<Value>| match pending.is_empty() {
+                true => None,
+                false => Some(Ok(std::mem::take(pending))),
+            };
             loop {
                 match &mut state {
                     BatchState::Failed(error) => return error.take().map(Err),
@@ -236,71 +255,117 @@ impl<'a> TranscriptSource<'a> {
                         return Some(Ok(payloads.by_ref().take(MAX_BATCH_OBSERVATIONS).collect()));
                     }
                     BatchState::Lines {
-                        lines,
+                        reader,
                         bytes,
-                        produced,
+                        line_no,
                         pending,
                     } => {
-                        let line = match lines.next() {
-                            None => {
-                                return match pending.is_empty() {
-                                    true => None,
-                                    false => Some(Ok(std::mem::take(pending))),
-                                };
+                        let remaining = byte_ceiling.saturating_sub(*bytes);
+                        if remaining == 0 {
+                            // The budget landed on a boundary: only real
+                            // bytes behind it mean the read stopped early.
+                            match reader.fill_buf() {
+                                Ok(available) => {
+                                    if !available.is_empty() {
+                                        let mut current = stats.get();
+                                        current.truncated = true;
+                                        stats.set(current);
+                                    }
+                                    return flush(pending);
+                                }
+                                Err(error) => {
+                                    return Some(Err(acop::Error::io(&entry.session.path)(error)));
+                                }
                             }
-                            Some(Err(error)) => {
+                        }
+                        let mut raw = Vec::new();
+                        let read = match std::io::Read::take(&mut *reader, remaining + 1)
+                            .read_until(b'\n', &mut raw)
+                        {
+                            Ok(read) => read,
+                            Err(error) => {
                                 return Some(Err(acop::Error::io(&entry.session.path)(error)));
                             }
-                            Some(Ok(line)) => line,
                         };
-                        *bytes += line.len() as u64 + 1;
-                        if *bytes > byte_ceiling {
-                            // Over the ceiling: the read stops here and the
-                            // emitted prefix is marked partial — never scan
-                            // the rest of a runaway store.
+                        *bytes += read as u64;
+                        if read == 0 {
+                            return flush(pending);
+                        }
+                        if raw.last() != Some(&b'\n') && read as u64 > remaining {
+                            // The budget cut mid-line: a partial record
+                            // settles nothing — stop and mark the prefix.
                             let mut current = stats.get();
                             current.truncated = true;
                             stats.set(current);
-                            return match pending.is_empty() {
-                                true => None,
-                                false => Some(Ok(std::mem::take(pending))),
-                            };
+                            return flush(pending);
                         }
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let Ok(record) = serde_json::from_str::<Value>(line) else {
-                            let mut current = stats.get();
-                            current.skipped_lines += 1;
-                            stats.set(current);
-                            continue;
-                        };
-                        let Some(metrics) = self.counters(&record) else {
-                            continue;
-                        };
-                        let observed_at = RECORD_TIME_FIELDS
-                            .iter()
-                            .find_map(|field| record.get(field).and_then(Value::as_str))
-                            .unwrap_or(fallback_observed_at);
-                        pending.push(json!({
-                            "schema": wire::USAGE,
-                            "observationId": observation_id(session_id, *produced),
-                            "revision": 1,
-                            "operation": "upsert",
-                            "sourceEpoch": source_epoch,
-                            "scopeRef": scope_ref,
-                            "observedAt": observed_at,
-                            "metrics": metrics,
-                        }));
-                        *produced += 1;
-                        if pending.len() >= MAX_BATCH_OBSERVATIONS {
-                            return Some(Ok(std::mem::take(pending)));
+                        let ordinal = *line_no;
+                        *line_no += 1;
+                        let line = String::from_utf8_lossy(&raw);
+                        match self.project_line(
+                            session_id,
+                            ordinal,
+                            line.trim(),
+                            source_epoch,
+                            scope_ref,
+                            fallback_observed_at,
+                        ) {
+                            LineProjection::Payload(payload) => {
+                                pending.push(payload);
+                                if pending.len() >= MAX_BATCH_OBSERVATIONS {
+                                    return Some(Ok(std::mem::take(pending)));
+                                }
+                            }
+                            LineProjection::Malformed => {
+                                let mut current = stats.get();
+                                current.skipped_lines += 1;
+                                stats.set(current);
+                            }
+                            LineProjection::Empty | LineProjection::NoCounters => {}
                         }
                     }
                 }
             }
         })
+    }
+
+    /// The spec applied to one raw store line: the projection every read
+    /// path shares, so identities and payloads cannot drift between the
+    /// streaming walk and `collect_lines`. `ordinal` is the line's own
+    /// position in the store — settled observation ids carry it, so a
+    /// rescan names the same records it named before.
+    fn project_line(
+        &self,
+        session_id: &str,
+        ordinal: usize,
+        line: &str,
+        source_epoch: &str,
+        scope_ref: &str,
+        fallback_observed_at: &str,
+    ) -> LineProjection {
+        if line.is_empty() {
+            return LineProjection::Empty;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return LineProjection::Malformed;
+        };
+        let Some(metrics) = self.counters(&record) else {
+            return LineProjection::NoCounters;
+        };
+        let observed_at = RECORD_TIME_FIELDS
+            .iter()
+            .find_map(|field| record.get(field).and_then(Value::as_str))
+            .unwrap_or(fallback_observed_at);
+        LineProjection::Payload(json!({
+            "schema": wire::USAGE,
+            "observationId": observation_id(session_id, ordinal),
+            "revision": 1,
+            "operation": "upsert",
+            "sourceEpoch": source_epoch,
+            "scopeRef": scope_ref,
+            "observedAt": observed_at,
+            "metrics": metrics,
+        }))
     }
 
     /// The container-store path: canonical records out of `decode_session`,
@@ -354,31 +419,18 @@ impl<'a> TranscriptSource<'a> {
         let mut payloads = Vec::new();
         let mut skipped_lines = 0;
         for (index, line) in lines.enumerate() {
-            let line = line.as_ref().trim();
-            if line.is_empty() {
-                continue;
+            match self.project_line(
+                session_id,
+                index,
+                line.as_ref().trim(),
+                source_epoch,
+                scope_ref,
+                fallback_observed_at,
+            ) {
+                LineProjection::Payload(payload) => payloads.push(payload),
+                LineProjection::Malformed => skipped_lines += 1,
+                LineProjection::Empty | LineProjection::NoCounters => {}
             }
-            let Ok(record) = serde_json::from_str::<Value>(line) else {
-                skipped_lines += 1;
-                continue;
-            };
-            let Some(metrics) = self.counters(&record) else {
-                continue;
-            };
-            let observed_at = RECORD_TIME_FIELDS
-                .iter()
-                .find_map(|field| record.get(field).and_then(Value::as_str))
-                .unwrap_or(fallback_observed_at);
-            payloads.push(json!({
-                "schema": wire::USAGE,
-                "observationId": observation_id(session_id, index),
-                "revision": 1,
-                "operation": "upsert",
-                "sourceEpoch": source_epoch,
-                "scopeRef": scope_ref,
-                "observedAt": observed_at,
-                "metrics": metrics,
-            }));
         }
         Collected {
             payloads,
