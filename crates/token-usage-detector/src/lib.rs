@@ -91,12 +91,19 @@ mod tests {
     /// consuming kernel, so no host crate may appear in its manifest. The
     /// guarded set is the crates that consume this one today — the
     /// `agent-statistics` kernel and `balance-detector` sibling, the `a4aa`
-    /// host adapter and the `fairlead` gateway — the same direction rule
-    /// `agent-statistics` applies to the analytics package above it.
+    /// host adapter, the `acop-usage-source` read adapter and the
+    /// `fairliny-gateway` — the same direction rule `agent-statistics`
+    /// applies to the analytics package above it.
     #[test]
     fn the_manifest_names_no_consumer() {
         let manifest = include_str!("../Cargo.toml");
-        for consumer in ["agent-statistics", "balance-detector", "a4aa", "fairlead"] {
+        for consumer in [
+            "agent-statistics",
+            "balance-detector",
+            "a4aa",
+            "acop-usage-source",
+            "fairliny-gateway",
+        ] {
             assert!(
                 !manifest.contains(consumer),
                 "{consumer} is above, not below"

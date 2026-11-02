@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/acop-usage-source",
     "crates/agent-statistics",
     "crates/collection-store",
     "crates/balance-detector",
@@ -14,6 +15,7 @@ license = "Apache-2.0"
 repository = "https://github.com/Unka-Malloc/Metera"
 
 [workspace.dependencies]
+acop = { path = "../ACOP/crates/acop", version = "0.1.2" }
 token-usage-detector = { path = "crates/token-usage-detector", version = "0.2.1" }
 collection-store = { path = "crates/collection-store", version = "0.1.0" }
 # The flywheel owns the graph-run usage store this crate's journal shares.
