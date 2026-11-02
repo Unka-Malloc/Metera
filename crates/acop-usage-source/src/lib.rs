@@ -387,4 +387,58 @@ mod tests {
         ]);
         assert!(collected.payloads.is_empty());
     }
+
+    // The codex rollout keeps its canonical usage envelope in a top-level
+    // `token_usage_record` record and mirrors the same `token_count` payload
+    // into the `event_msg` stream for the UI. The declared discriminator is
+    // the outer `type`; matching `payload.type` instead would settle every
+    // turn twice. This fixture mirrors `a4aa-codex`'s `TranscriptUsage`.
+    const CODEX_SPEC: TranscriptUsage = TranscriptUsage {
+        root: "codex-sessions",
+        record: Some(("type", "token_usage_record")),
+        container: "payload.info.last_token_usage",
+        input: &["input_tokens"],
+        cached: &["cached_input_tokens"],
+        output: &["output_tokens"],
+        total: &[],
+        temporality: UsageTemporality::Delta,
+    };
+
+    #[test]
+    fn codex_rollout_shape_matches_and_event_msg_mirror_is_skipped() {
+        let collected = TranscriptSource {
+            codec: &NeverCodec,
+            usage: CODEX_SPEC,
+        }
+        .collect_lines(
+            "rollout-1",
+            [
+                r#"{"type":"session_meta","payload":{"id":"r-1"}}"#,
+                r#"{"type":"token_usage_record","timestamp":"2026-10-24T09:30:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":100,"output_tokens":40,"total_tokens":940},"last_token_usage":{"input_tokens":300,"cached_input_tokens":50,"output_tokens":15,"reasoning_output_tokens":4,"total_tokens":319}},"rate_limits":{"primary":{"used_percent":3}}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":100,"output_tokens":40,"total_tokens":940},"last_token_usage":{"input_tokens":300,"cached_input_tokens":50,"output_tokens":15,"reasoning_output_tokens":4,"total_tokens":319}},"rate_limits":{"primary":{"used_percent":3}}}}"#,
+            ]
+            .iter(),
+            "epoch-1",
+            "scope-1",
+            "2026-10-24T09:30:01Z",
+        );
+        assert_eq!(collected.payloads.len(), 1);
+        let observation =
+            UsageObservation::from_value(collected.payloads[0].clone()).expect("wire payload");
+        assert_eq!(observation.observed_at, "2026-10-24T09:30:00Z");
+        assert_eq!(
+            observation.metrics[metrics::TOKENS_INPUT].value.as_deref(),
+            Some("300")
+        );
+        assert_eq!(
+            observation.metrics[metrics::TOKENS_CACHED_INPUT]
+                .value
+                .as_deref(),
+            Some("50")
+        );
+        assert_eq!(
+            observation.metrics[metrics::TOKENS_OUTPUT].value.as_deref(),
+            Some("15")
+        );
+    }
 }
