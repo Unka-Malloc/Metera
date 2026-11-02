@@ -51,9 +51,16 @@ pub fn transcript_binding(
 /// payload carries what the host bound, never a second opinion about who
 /// produced it. Payloads publish in bounded chunks — a long session
 /// settles as several `usage.publish` batches, not one oversized frame.
-/// `skipped_lines` stays visible to the caller: undecodable store lines
+/// The settled ingest plus the store defects the read observed:
+/// `skipped_lines` stays visible to the caller — undecodable store lines
 /// are the store's defect, and silently swallowing them would read as
 /// "no usage".
+#[derive(Debug)]
+pub struct TranscriptReport {
+    pub ingest: IngestReport,
+    pub skipped_lines: usize,
+}
+
 pub fn collect_transcript_session(
     host: &mut UsageSourceHost,
     admission: &SourceAdmission,
@@ -61,7 +68,7 @@ pub fn collect_transcript_session(
     entry: &SessionEntry,
     scope_ref: &str,
     fallback_observed_at: &str,
-) -> Result<IngestReport> {
+) -> Result<TranscriptReport> {
     let collected = source
         .collect(
             entry,
@@ -87,7 +94,10 @@ pub fn collect_transcript_session(
         merged.events.extend(report.events);
         merged.cursor = report.cursor;
     }
-    Ok(merged)
+    Ok(TranscriptReport {
+        ingest: merged,
+        skipped_lines: collected.skipped_lines,
+    })
 }
 
 #[cfg(test)]
@@ -181,8 +191,9 @@ mod tests {
             "2026-11-02T00:00:00Z",
         )
         .expect("collect");
-        assert_eq!(report.accepted, 1);
-        assert!(report.refused.is_empty());
+        assert_eq!(report.ingest.accepted, 1);
+        assert_eq!(report.skipped_lines, 0);
+        assert!(report.ingest.refused.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

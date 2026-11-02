@@ -258,11 +258,12 @@ impl<'a> TranscriptSource<'a> {
 fn observation_id(session_id: &str, line_index: usize) -> String {
     const LIMIT: usize = token_usage_detector::usage::MAX_OBSERVATION_ID_BYTES;
     let suffix = format!("#{line_index}");
-    let head: String = session_id
-        .chars()
-        .take(LIMIT.saturating_sub(suffix.len()))
-        .collect();
-    format!("{head}{suffix}")
+    let budget = LIMIT.saturating_sub(suffix.len());
+    let end = (0..=budget.min(session_id.len()))
+        .rev()
+        .find(|&i| session_id.is_char_boundary(i))
+        .unwrap_or(0);
+    format!("{}{}", &session_id[..end], suffix)
 }
 
 #[cfg(test)]
@@ -439,6 +440,121 @@ mod tests {
         assert_eq!(
             observation.metrics[metrics::TOKENS_OUTPUT].value.as_deref(),
             Some("15")
+        );
+    }
+
+    // Container-backed stores (a database row per session, `SessionRef.key`
+    // set) are read through the codec's `decode_session`; each Meta record
+    // is rewrapped `{subtype, data}` → `{type, payload}` so the spec's raw
+    // paths still resolve. The decoder's skipped lines stay counted.
+    struct ContainerCodec;
+    impl Codec for ContainerCodec {
+        fn id(&self) -> &'static str {
+            "synthetic-container"
+        }
+        fn history(&self) -> Vec<acop::HistoryRoot> {
+            Vec::new()
+        }
+        fn session_kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn capabilities(&self) -> &'static acop::CapabilityMatrix {
+            &acop::CapabilityMatrix::READ_ONLY
+        }
+        fn decode(&self, _path: &Path) -> acop::Result<acop::codec::Decoded> {
+            unreachable!("container sessions decode by key")
+        }
+        fn decode_session(
+            &self,
+            _session: &acop::codec::SessionRef,
+        ) -> acop::Result<acop::codec::Decoded> {
+            let mut conversation = acop::Conversation::new("row-1");
+            conversation.records = vec![
+                acop::Record {
+                    id: None,
+                    parent: None,
+                    ts: Some("2026-10-24T09:30:00Z".to_owned()),
+                    ordinal: 0,
+                    body: acop::Body::Meta {
+                        subtype: "session_meta".to_owned(),
+                        data: json!({"id": "row-1"}),
+                    },
+                },
+                acop::Record {
+                    id: None,
+                    parent: None,
+                    ts: Some("2026-10-24T09:31:00Z".to_owned()),
+                    ordinal: 1,
+                    body: acop::Body::Meta {
+                        subtype: "token_usage_record".to_owned(),
+                        data: json!({
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 20,
+                                    "cached_input_tokens": 4,
+                                    "output_tokens": 3
+                                }
+                            }
+                        }),
+                    },
+                },
+            ];
+            Ok(acop::codec::Decoded {
+                conversation,
+                record_lines: vec![0, 1],
+                line_count: 2,
+                skipped: vec![acop::codec::Skipped {
+                    line: 2,
+                    native_type: None,
+                    reason: "corrupt".to_owned(),
+                }],
+            })
+        }
+        fn encode(&self, _conversation: &acop::Conversation) -> acop::Result<acop::codec::Encoded> {
+            unreachable!("read-only")
+        }
+        fn store_path(
+            &self,
+            _home: &Path,
+            _conversation: &acop::Conversation,
+        ) -> acop::Result<std::path::PathBuf> {
+            unreachable!("read-only")
+        }
+        fn redact_line(&self, _line: &Value, _pattern: &str) -> Option<Value> {
+            unreachable!("read-only")
+        }
+    }
+
+    #[test]
+    fn container_sessions_decode_by_key_and_count_decoder_skips() {
+        let entry = acop::SessionEntry {
+            session: acop::codec::SessionRef {
+                id: "row-1".to_owned(),
+                path: std::path::PathBuf::from("store.db"),
+                key: Some("composerData:1".to_owned()),
+                parent: None,
+            },
+            kind: "codex-sessions",
+        };
+        let collected = TranscriptSource {
+            codec: &ContainerCodec,
+            usage: CODEX_SPEC,
+        }
+        .collect(&entry, "epoch-1", "scope-1", "2026-10-24T09:31:01Z")
+        .expect("container collect");
+        assert_eq!(collected.skipped_lines, 1);
+        assert_eq!(collected.payloads.len(), 1);
+        let observation =
+            UsageObservation::from_value(collected.payloads[0].clone()).expect("wire payload");
+        assert_eq!(observation.observed_at, "2026-10-24T09:31:00Z");
+        assert_eq!(
+            observation.metrics[metrics::TOKENS_INPUT].value.as_deref(),
+            Some("20")
+        );
+        assert_eq!(
+            observation.metrics[metrics::TOKENS_OUTPUT].value.as_deref(),
+            Some("3")
         );
     }
 }

@@ -25,6 +25,21 @@ shared detector contract. Raw counters are not bound accounting observations:
 the host must map them into usage observations and bind them through
 `SourceBinding` before accounting.
 
+## Verify
+
+`scripts/verify.sh` — fmt + clippy + tests across the workspace.
+
+The workspace builds against one sibling checkout — a Cargo path
+dependency resolves it at the version `Cargo.toml` declares:
+
+| Path | Repository | Provides |
+| --- | --- | --- |
+| `../ACOP` | `Unka-Malloc/ACOP` | `acop` |
+
+Clone it beside this repository before building; a fresh clone without
+it cannot compile `acop-usage-source` or the `agent-statistics`
+transcript collection that depends on it.
+
 ## License
 
 Apache-2.0

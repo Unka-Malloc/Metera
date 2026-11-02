@@ -118,6 +118,10 @@ impl ReadingSettlement {
 pub struct UsageSourceHost {
     journal: UsageJournal,
     data_home: PathBuf,
+    /// Rendered exposition reuse: `(facts watermark, gateway fingerprint,
+    /// text)`. A scrape re-renders only when the journal's writes or the
+    /// gateway counters actually changed.
+    exposition_cache: std::sync::Mutex<Option<(i64, u64, String)>>,
 }
 
 impl std::fmt::Debug for UsageSourceHost {
@@ -139,6 +143,7 @@ impl UsageSourceHost {
         Ok(Self {
             journal: UsageJournal::open(&resolved)?,
             data_home,
+            exposition_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -152,6 +157,31 @@ impl UsageSourceHost {
         self.data_home
             .join("agent-usage")
             .join(WORKFLOW_LEDGER_FILE_NAME)
+    }
+
+    /// Serve a rendered exposition from cache while nothing changed: the
+    /// journal's write watermark covers settled and retracted facts, the
+    /// fingerprint covers the gateway document folded into the text. A
+    /// scrape re-renders on real change, never on interval.
+    pub fn exposition_cached(
+        &self,
+        gateway_fingerprint: u64,
+        render: impl FnOnce(&Self) -> LedgerResult<String>,
+    ) -> LedgerResult<String> {
+        let watermark = self.journal.facts_watermark()?;
+        let mut slot = self
+            .exposition_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some((at, fingerprint, text)) = &*slot
+            && *at == watermark
+            && *fingerprint == gateway_fingerprint
+        {
+            return Ok(text.clone());
+        }
+        let text = render(self)?;
+        *slot = Some((watermark, gateway_fingerprint, text.clone()));
+        Ok(text)
     }
 
     /// Issue the admission one source presents to the journal: the binding the

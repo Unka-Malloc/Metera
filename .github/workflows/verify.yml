@@ -12,15 +12,24 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      # actions/checkout v4.2.2
+      # actions/checkout v4.2.2 — both repositories land side by side so
+      # the `../ACOP` Cargo path dependency resolves (see README's
+      # sibling-checkout table).
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          path: Metera
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: Unka-Malloc/ACOP
+          path: ACOP
           persist-credentials: false
       # dtolnay/rust-toolchain @stable
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: stable
       - run: ./scripts/verify.sh
+        working-directory: Metera
 
   # The detector publishes a lower MSRV than the workspace toolchain: it is
   # built and tested alone on its declared floor so the embeddable SDK's
@@ -30,8 +39,15 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          path: Metera
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: Unka-Malloc/ACOP
+          path: ACOP
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: "1.85"
       - run: cargo test -p token-usage-detector --locked
+        working-directory: Metera

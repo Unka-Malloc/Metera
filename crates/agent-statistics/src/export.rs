@@ -57,10 +57,12 @@ use crate::source_host::UsageSourceHost;
 /// truncates deterministically rather than growing a scrape without bound.
 pub const MAX_EXPORTED_SERIES: usize = 256;
 
-/// The most retained facts one scrape folds. Past it the scan truncates —
-/// the exposition is a projection, never a second pass over history — and
-/// the text says so explicitly through `metera_export_truncated`.
-pub const MAX_EXPORT_FACTS: usize = 100_000;
+/// The most retained facts one scrape folds before the projection admits
+/// it summarized a prefix through `metera_export_truncated`. The cap is
+/// sized far past what the emitted series need: state is O(series), not
+/// O(facts), so the bound exists to keep a pathological store readable —
+/// not to bound memory.
+pub const MAX_EXPORT_FACTS: usize = 1_000_000;
 
 /// The label a counter family folds overflow into, matching the recorder's
 /// own `Other` model bucket.
@@ -86,21 +88,41 @@ pub fn exposition(facts: &[MeteringFact], gateway: Option<&UsageDocument>) -> St
 /// `metera_export_truncated` so a partial projection cannot pass for the
 /// whole record.
 pub fn render(host: &UsageSourceHost, gateway: Option<&UsageDocument>) -> LedgerResult<String> {
-    let mut projection = FactProjection::default();
-    let mut cursor = None;
-    loop {
-        let page = host.read(cursor.as_deref(), MAX_FACT_PAGE)?;
-        cursor = page.next_cursor;
-        projection.scan(&page.facts, MAX_EXPORT_FACTS);
-        if projection.truncated || cursor.is_none() {
-            break;
+    // A scrape is read-mostly: the journal changes on settlement, not on
+    // scrape, so the rendered text caches against the journal's write
+    // watermark instead of re-walking retained facts every time
+    // Prometheus asks.
+    host.exposition_cached(gateway_fingerprint(gateway), |host| {
+        let mut projection = FactProjection::default();
+        let mut cursor = None;
+        loop {
+            let page = host.read(cursor.as_deref(), MAX_FACT_PAGE)?;
+            cursor = page.next_cursor;
+            projection.scan(&page.facts, MAX_EXPORT_FACTS);
+            if projection.truncated || cursor.is_none() {
+                break;
+            }
         }
-    }
-    Ok(projection.exposition(gateway))
+        Ok(projection.exposition(gateway))
+    })
 }
 
-/// One `(source, model, kind)` row of the token projection.
-type TokenRow = (String, String, String, bool, Option<ExactNumber>);
+/// Cache key for one gateway document: the exposition folds its counters
+/// in, so a scrape with different counters may not reuse another's text.
+fn gateway_fingerprint(gateway: Option<&UsageDocument>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match gateway {
+        Some(document) => serde_json::to_string(document)
+            .unwrap_or_default()
+            .hash(&mut hasher),
+        None => 0u8.hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// One `(source, model, kind)` series over the token metrics.
+type TokenKey = (String, String, String);
 
 /// The streaming projection a scrape folds retained facts into: bounded
 /// per-series state, a scanned-fact count and an explicit truncation flag.
@@ -116,7 +138,19 @@ type BalanceLatest = BTreeMap<BalanceKey, (i128, Option<ExactNumber>)>;
 
 #[derive(Default)]
 struct FactProjection {
-    token_rows: Vec<TokenRow>,
+    totals: BTreeMap<TokenKey, ExactNumber>,
+    unknown: BTreeMap<TokenKey, u64>,
+    /// Series that can no longer be summed honestly — an unparseable
+    /// reading or an overflowing total — moved under the unknown
+    /// readings instead of emitting a silently incomplete total.
+    tainted: BTreeSet<TokenKey>,
+    /// Counted readings per series: needed when a folded merge taints a
+    /// series the counter already summed, so its readings land under
+    /// unknown rather than vanishing with the dropped total.
+    counted: BTreeMap<TokenKey, u64>,
+    /// Distinct attributed model labels seen: the model fold decided at
+    /// emit time needs the set, not the rows.
+    models: BTreeSet<String>,
     balance_latest: BalanceLatest,
     scanned: usize,
     truncated: bool,
@@ -168,17 +202,43 @@ impl FactProjection {
         let Some(kind) = token_kind(&fact.metric) else {
             return;
         };
-        let model = reading_model(&fact.fact_id)
-            .unwrap_or(UNATTRIBUTED_MODEL)
-            .to_owned();
-        let value = fact.value.as_deref().and_then(ExactNumber::parse);
-        self.token_rows.push((
-            fact.source_ref.clone(),
-            model,
-            kind,
-            fact.value.is_some(),
-            value,
-        ));
+        let model = reading_model(&fact.fact_id).unwrap_or(UNATTRIBUTED_MODEL);
+        if model != UNATTRIBUTED_MODEL {
+            self.models.insert(model.to_owned());
+        }
+        let key = (fact.source_ref.clone(), model.to_owned(), kind);
+        if fact.value.is_none() {
+            *self.unknown.entry(key).or_default() += 1;
+            return;
+        }
+        *self.counted.entry(key.clone()).or_default() += 1;
+        if self.tainted.contains(&key) {
+            *self.unknown.entry(key).or_default() += 1;
+            return;
+        }
+        let Some(value) = fact.value.as_deref().and_then(ExactNumber::parse) else {
+            // A reading the journal counted but the projection cannot
+            // parse has no honest number — withdraw any total the series
+            // already emitted and taint it rather than skipping silently.
+            self.totals.remove(&key);
+            self.tainted.insert(key.clone());
+            *self.unknown.entry(key).or_default() += 1;
+            return;
+        };
+        match self.totals.remove(&key) {
+            Some(total) => match total.checked_add(value) {
+                Some(sum) => {
+                    self.totals.insert(key, sum);
+                }
+                None => {
+                    self.tainted.insert(key.clone());
+                    *self.unknown.entry(key).or_default() += 1;
+                }
+            },
+            None => {
+                self.totals.insert(key, value);
+            }
+        }
     }
 
     /// Emit the exposition text for what the scan folded. Truncation is
@@ -191,7 +251,7 @@ impl FactProjection {
         let truncated = self.truncated
             | write_balance_family(&mut out, &self.balance_latest)
             | write_gateway_families(&mut out, gateway)
-            | write_token_families(&mut out, &self.token_rows);
+            | write_token_families(&mut out, self);
         if truncated {
             header(
                 &mut out,
@@ -205,9 +265,6 @@ impl FactProjection {
         out
     }
 }
-
-/// One `(source, model, kind)` series over the token metrics.
-type TokenKey = (String, String, String);
 
 /// The kind label a token-unit metric exports under: the shared counters keep
 /// their contract kinds; a provider-native token counter keeps its own leaf
@@ -384,63 +441,51 @@ fn accumulate(
     }
 }
 
-/// The token totals and the unknown readings over the folded rows.
+/// The token totals and the unknown readings over the folded series.
 /// Returns whether any family truncated at the series limit.
-fn write_token_families(out: &mut String, rows: &[TokenRow]) -> bool {
-    // Model labels fold past the bound in a second pass, so a crowded
-    // scrape stays bounded instead of dropping a total.
-    // The unattributed bucket never consumes a model slot.
-    let distinct: BTreeSet<String> = rows
-        .iter()
-        .map(|(_, model, ..)| model.clone())
-        .filter(|model| model != UNATTRIBUTED_MODEL)
-        .collect();
-    let folded: BTreeSet<String> = distinct.into_iter().skip(MAX_MODELS_PER_DAY).collect();
+fn write_token_families(out: &mut String, projection: &FactProjection) -> bool {
+    // Model labels fold past the bound at emit time, so a crowded scrape
+    // merges labels instead of dropping totals. The merge runs over
+    // series keys — O(#series), never O(#facts).
+    let folded: BTreeSet<&String> = projection.models.iter().skip(MAX_MODELS_PER_DAY).collect();
+    let remap = |key: &TokenKey| -> TokenKey {
+        if folded.contains(&key.1) {
+            (key.0.clone(), FOLDED_LABEL.to_owned(), key.2.clone())
+        } else {
+            key.clone()
+        }
+    };
+    // A merged key is tainted when any raw key under it was tainted: its
+    // counted readings then join the unknown readings the raw keys
+    // already produced, matching the per-row rule a live fold applied.
+    let mut tainted: BTreeSet<TokenKey> = projection.tainted.iter().map(&remap).collect();
     let mut totals: BTreeMap<TokenKey, ExactNumber> = BTreeMap::new();
     let mut unknown: BTreeMap<TokenKey, u64> = BTreeMap::new();
-    // A series that could not be summed honestly — a counted reading that
-    // did not parse, or an exact sum that overflowed — is tainted: it
-    // leaves the totals and lands under the unknown readings instead of
-    // emitting a silently incomplete total. Taint is not truncation: every
-    // tainted reading is represented in `metera_usage_unknown_facts`, so
-    // nothing was omitted.
-    let mut tainted: BTreeSet<TokenKey> = BTreeSet::new();
-    for (source, model, kind, counted, value) in rows {
-        let model = match folded.contains(model) {
-            true => FOLDED_LABEL.to_owned(),
-            false => model.clone(),
-        };
-        let key = (source.clone(), model, kind.clone());
-        if *counted {
-            if tainted.contains(&key) {
-                *unknown.entry(key).or_default() += 1;
-            } else if let Some(value) = *value {
-                match totals.remove(&key) {
-                    Some(total) => match total.checked_add(value) {
-                        Some(sum) => {
-                            totals.insert(key, sum);
-                        }
-                        None => {
-                            tainted.insert(key.clone());
-                            *unknown.entry(key).or_default() += 1;
-                        }
-                    },
-                    None => {
-                        totals.insert(key, value);
-                    }
-                }
-            } else {
-                // A reading the journal counted but the projection cannot
-                // parse has no honest number — withdraw any total the
-                // series already emitted and taint it the way an overflow
-                // does rather than skipping it silently.
-                totals.remove(&key);
-                tainted.insert(key.clone());
-                *unknown.entry(key).or_default() += 1;
-            }
-        } else {
-            *unknown.entry(key).or_default() += 1;
+    for (key, total) in &projection.totals {
+        let merged = remap(key);
+        if tainted.contains(&merged) {
+            *unknown.entry(merged).or_default() +=
+                projection.counted.get(key).copied().unwrap_or(0);
+            continue;
         }
+        match totals.remove(&merged) {
+            Some(sum) => match sum.checked_add(*total) {
+                Some(sum) => {
+                    totals.insert(merged, sum);
+                }
+                None => {
+                    tainted.insert(merged.clone());
+                    *unknown.entry(merged).or_default() +=
+                        projection.counted.get(key).copied().unwrap_or(0);
+                }
+            },
+            None => {
+                totals.insert(merged, *total);
+            }
+        }
+    }
+    for (key, count) in &projection.unknown {
+        *unknown.entry(remap(key)).or_default() += count;
     }
     if !totals.is_empty() {
         header(

@@ -81,6 +81,11 @@ pub const USAGE_JOURNAL_RETENTION_MS: i64 = 400 * 24 * 60 * 60 * 1_000;
 /// write path never pays a sweep per call.
 const SWEEP_INTERVAL_MS: i64 = 60 * 60 * 1_000;
 
+/// Rows one retention batch drops before the next statement: bounded so a
+/// long-idle journal sweeps in small writes instead of one WAL-sized
+/// transaction.
+const SWEEP_BATCH: usize = 2_000;
+
 /// How far ahead of the journal's clock a measurement may claim to be:
 /// 24 hours of clock-skew grace. A timestamp claimed further into the
 /// future would stay "fresh" longer than any retraction tombstone lives,
@@ -529,30 +534,56 @@ impl UsageJournal {
     fn sweep_retention(&self, now_ms: i64) -> LedgerResult<()> {
         let cutoff = now_ms - USAGE_JOURNAL_RETENTION_MS;
         let tombstone_cutoff = cutoff - MAX_OBSERVED_AHEAD_MS;
-        for (statement, bound) in [
+        for (table, predicate, bound) in [
+            ("usage_source_facts", "updated_at_ms<?1", cutoff),
             (
-                "DELETE FROM usage_source_facts WHERE updated_at_ms<?1",
+                "usage_source_events",
+                "retracted=0 AND settled_at_ms<?1",
                 cutoff,
             ),
             (
-                "DELETE FROM usage_source_events WHERE retracted=0 AND settled_at_ms<?1",
-                cutoff,
-            ),
-            (
-                "DELETE FROM usage_source_events WHERE retracted=1 AND settled_at_ms<?1",
+                "usage_source_events",
+                "retracted=1 AND settled_at_ms<?1",
                 tombstone_cutoff,
             ),
-            (
-                "DELETE FROM usage_source_cursors WHERE updated_at_ms<?1",
-                cutoff,
-            ),
+            ("usage_source_cursors", "updated_at_ms<?1", cutoff),
         ] {
-            self.ledger
-                .connection
-                .execute(statement, params![bound])
-                .map_err(|_| LedgerError::storage())?;
+            // Bounded batches keep each write small: one giant DELETE grows
+            // the WAL in proportion to the dropped history before the store
+            // can checkpoint it.
+            let statement = format!(
+                "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {predicate} LIMIT ?2)"
+            );
+            loop {
+                let deleted = self
+                    .ledger
+                    .connection
+                    .execute(
+                        &statement,
+                        params![bound, sqlite_counter(SWEEP_BATCH as u64)?],
+                    )
+                    .map_err(|_| LedgerError::storage())?;
+                if deleted == 0 {
+                    break;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The newest fact-write instant in the store: expositions cache
+    /// against it, re-rendering only when settlement or retraction moves
+    /// it forward. Swept rows are already invisible to readers, so their
+    /// removal does not need to bump the watermark.
+    pub fn facts_watermark(&self) -> LedgerResult<i64> {
+        self.ledger
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(updated_at_ms),0) FROM usage_source_facts",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| LedgerError::storage())
     }
 
     /// The exact total of one scope and metric over the facts that may settle.
@@ -912,21 +943,32 @@ impl MeteringFactPort for UsageJournal {
         }
         let limit = limit.min(MAX_FACT_PAGE);
         let cutoff = now_ms() - USAGE_JOURNAL_RETENTION_MS;
-        let mut statement = self
-            .ledger
-            .connection
-            .prepare(
+        // The keyset predicate stays sargable: a `? IS NULL OR` clause would
+        // fold the seek away and make every page rescan from the first row.
+        let sql = match cursor {
+            None => {
                 "SELECT fact_id,scope_ref,metric,value,unit,quality,eligibility,
                         source_ref,observed_at
                  FROM usage_source_facts
-                 WHERE retracted=0 AND updated_at_ms>=?3
-                   AND (?1 IS NULL OR fact_id>?1)
-                 ORDER BY fact_id LIMIT ?2",
-            )
+                 WHERE retracted=0 AND updated_at_ms>=?2
+                 ORDER BY fact_id LIMIT ?3"
+            }
+            Some(_) => {
+                "SELECT fact_id,scope_ref,metric,value,unit,quality,eligibility,
+                        source_ref,observed_at
+                 FROM usage_source_facts
+                 WHERE retracted=0 AND updated_at_ms>=?2 AND fact_id>?1
+                 ORDER BY fact_id LIMIT ?3"
+            }
+        };
+        let mut statement = self
+            .ledger
+            .connection
+            .prepare(sql)
             .map_err(|_| LedgerError::storage())?;
         let rows = statement
             .query_map(
-                params![cursor, sqlite_counter((limit + 1) as u64)?, cutoff],
+                params![cursor, cutoff, sqlite_counter((limit + 1) as u64)?],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
