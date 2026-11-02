@@ -84,6 +84,42 @@ pub struct TranscriptSource<'a> {
 pub struct Collected {
     pub payloads: Vec<Value>,
     pub skipped_lines: usize,
+    /// The session's bytes ran past [`MAX_SESSION_BYTES`]: `payloads`
+    /// holds the explicitly partial prefix the ceiling allowed.
+    pub truncated: bool,
+}
+
+/// One session's file bytes a single read may walk before it must stop:
+/// a runaway or dumped store settles its prefix, never the host's
+/// memory. Sized far above a real rollout transcript.
+pub const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The read's outcome beyond the payloads themselves.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadStats {
+    /// Native lines that failed to decode — a store defect the caller
+    /// must see, since swallowing it would read as "no usage".
+    pub skipped_lines: usize,
+    /// The session's bytes ran past [`MAX_SESSION_BYTES`]: the read
+    /// stopped and the emitted prefix is explicitly partial.
+    pub truncated: bool,
+}
+
+/// Payloads one emitted batch carries: the publish bound the wire
+/// vocabulary already names.
+const MAX_BATCH_OBSERVATIONS: usize = token_usage_detector::collection::MAX_BATCH_OBSERVATIONS;
+
+/// The streaming read's open state — decoded container records, a
+/// buffered file walk, or the open/read failure surfaced once.
+enum BatchState {
+    Decoded(std::vec::IntoIter<Value>),
+    Lines {
+        lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
+        bytes: u64,
+        produced: usize,
+        pending: Vec<Value>,
+    },
+    Failed(Option<acop::Error>),
 }
 
 impl<'a> TranscriptSource<'a> {
@@ -114,18 +150,157 @@ impl<'a> TranscriptSource<'a> {
         scope_ref: &str,
         fallback_observed_at: &str,
     ) -> acop::Result<Collected> {
-        if entry.session.key.is_some() {
-            return self.collect_decoded(entry, source_epoch, scope_ref, fallback_observed_at);
+        let stats = std::cell::Cell::new(ReadStats::default());
+        let mut payloads = Vec::new();
+        for batch in
+            self.payload_batches(entry, source_epoch, scope_ref, fallback_observed_at, &stats)
+        {
+            payloads.extend(batch?);
         }
-        let text = std::fs::read_to_string(&entry.session.path)
-            .map_err(acop::Error::io(&entry.session.path))?;
-        Ok(self.collect_lines(
-            &entry.session.id,
-            text.lines(),
+        let stats = stats.get();
+        Ok(Collected {
+            payloads,
+            skipped_lines: stats.skipped_lines,
+            truncated: stats.truncated,
+        })
+    }
+
+    /// Stream one session's payloads in publish-sized batches.
+    ///
+    /// The session is never materialized: a file streams through a
+    /// buffered reader and each batch carries at most
+    /// [`MAX_BATCH_OBSERVATIONS`] payloads, so peak memory is one batch
+    /// plus one line. Bytes past [`MAX_SESSION_BYTES`] stop the read and
+    /// mark `stats.truncated` — a huge store settles its prefix rather
+    /// than exhausting the host's memory. `stats` reports skipped lines
+    /// and truncation as they happen.
+    pub fn payload_batches(
+        &'a self,
+        entry: &'a SessionEntry,
+        source_epoch: &'a str,
+        scope_ref: &'a str,
+        fallback_observed_at: &'a str,
+        stats: &'a std::cell::Cell<ReadStats>,
+    ) -> impl Iterator<Item = acop::Result<Vec<Value>>> + 'a {
+        self.payload_batches_up_to(
+            entry,
             source_epoch,
             scope_ref,
             fallback_observed_at,
-        ))
+            stats,
+            MAX_SESSION_BYTES,
+        )
+    }
+
+    /// `payload_batches` with the byte ceiling explicit, so tests can
+    /// drive the truncation branch without writing a real 64MiB store.
+    fn payload_batches_up_to(
+        &'a self,
+        entry: &'a SessionEntry,
+        source_epoch: &'a str,
+        scope_ref: &'a str,
+        fallback_observed_at: &'a str,
+        stats: &'a std::cell::Cell<ReadStats>,
+        byte_ceiling: u64,
+    ) -> impl Iterator<Item = acop::Result<Vec<Value>>> + 'a {
+        let mut state = if entry.session.key.is_some() {
+            match self.collect_decoded(entry, source_epoch, scope_ref, fallback_observed_at) {
+                Ok(collected) => {
+                    let mut current = stats.get();
+                    current.skipped_lines = collected.skipped_lines;
+                    stats.set(current);
+                    BatchState::Decoded(collected.payloads.into_iter())
+                }
+                Err(error) => BatchState::Failed(Some(error)),
+            }
+        } else {
+            match std::fs::File::open(&entry.session.path) {
+                Ok(file) => BatchState::Lines {
+                    lines: std::io::BufRead::lines(std::io::BufReader::new(file)),
+                    bytes: 0,
+                    produced: 0,
+                    pending: Vec::new(),
+                },
+                Err(error) => BatchState::Failed(Some(acop::Error::io(&entry.session.path)(error))),
+            }
+        };
+        let session_id = &entry.session.id;
+        std::iter::from_fn(move || {
+            loop {
+                match &mut state {
+                    BatchState::Failed(error) => return error.take().map(Err),
+                    BatchState::Decoded(payloads) => {
+                        if payloads.len() == 0 {
+                            return None;
+                        }
+                        return Some(Ok(payloads.by_ref().take(MAX_BATCH_OBSERVATIONS).collect()));
+                    }
+                    BatchState::Lines {
+                        lines,
+                        bytes,
+                        produced,
+                        pending,
+                    } => {
+                        let line = match lines.next() {
+                            None => {
+                                return match pending.is_empty() {
+                                    true => None,
+                                    false => Some(Ok(std::mem::take(pending))),
+                                };
+                            }
+                            Some(Err(error)) => {
+                                return Some(Err(acop::Error::io(&entry.session.path)(error)));
+                            }
+                            Some(Ok(line)) => line,
+                        };
+                        *bytes += line.len() as u64 + 1;
+                        if *bytes > byte_ceiling {
+                            // Over the ceiling: the read stops here and the
+                            // emitted prefix is marked partial — never scan
+                            // the rest of a runaway store.
+                            let mut current = stats.get();
+                            current.truncated = true;
+                            stats.set(current);
+                            return match pending.is_empty() {
+                                true => None,
+                                false => Some(Ok(std::mem::take(pending))),
+                            };
+                        }
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let Ok(record) = serde_json::from_str::<Value>(line) else {
+                            let mut current = stats.get();
+                            current.skipped_lines += 1;
+                            stats.set(current);
+                            continue;
+                        };
+                        let Some(metrics) = self.counters(&record) else {
+                            continue;
+                        };
+                        let observed_at = RECORD_TIME_FIELDS
+                            .iter()
+                            .find_map(|field| record.get(field).and_then(Value::as_str))
+                            .unwrap_or(fallback_observed_at);
+                        pending.push(json!({
+                            "schema": wire::USAGE,
+                            "observationId": observation_id(session_id, *produced),
+                            "revision": 1,
+                            "operation": "upsert",
+                            "sourceEpoch": source_epoch,
+                            "scopeRef": scope_ref,
+                            "observedAt": observed_at,
+                            "metrics": metrics,
+                        }));
+                        *produced += 1;
+                        if pending.len() >= MAX_BATCH_OBSERVATIONS {
+                            return Some(Ok(std::mem::take(pending)));
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// The container-store path: canonical records out of `decode_session`,
@@ -162,6 +337,7 @@ impl<'a> TranscriptSource<'a> {
         Ok(Collected {
             payloads,
             skipped_lines: decoded.skipped.len(),
+            truncated: false,
         })
     }
 
@@ -207,6 +383,7 @@ impl<'a> TranscriptSource<'a> {
         Collected {
             payloads,
             skipped_lines,
+            truncated: false,
         }
     }
 
@@ -556,5 +733,55 @@ mod tests {
             observation.metrics[metrics::TOKENS_OUTPUT].value.as_deref(),
             Some("3")
         );
+    }
+
+    #[test]
+    fn observation_ids_truncate_on_byte_boundaries() {
+        const LIMIT: usize = token_usage_detector::usage::MAX_OBSERVATION_ID_BYTES;
+        let session = "会话-".repeat(LIMIT); // multibyte, far over budget
+        let id = observation_id(&session, 12);
+        assert!(id.len() <= LIMIT, "{} > {LIMIT}", id.len());
+        assert!(id.ends_with("#12"));
+        // Deterministic and never splits a codepoint.
+        assert_eq!(id, observation_id(&session, 12));
+        std::str::from_utf8(id.as_bytes()).expect("valid utf-8 by construction");
+    }
+
+    #[test]
+    fn reads_stop_at_the_byte_ceiling_and_mark_the_prefix_partial() {
+        let dir = std::env::temp_dir().join(format!("acop-usage-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = "{\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":2,\"output_tokens\":1}}}}\n";
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, line.repeat(20)).unwrap();
+        let entry = SessionEntry {
+            session: acop::codec::SessionRef {
+                id: "session-ceiling".to_owned(),
+                path,
+                key: None,
+                parent: None,
+            },
+            kind: "synthetic-session-store",
+        };
+        let source = source();
+        let stats = std::cell::Cell::new(ReadStats::default());
+        let payloads: Vec<Value> = source
+            .payload_batches_up_to(
+                &entry,
+                "epoch",
+                "scope",
+                "2026-11-02T00:00:00Z",
+                &stats,
+                line.len() as u64 * 3,
+            )
+            .collect::<acop::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        let stats = stats.get();
+        assert!(stats.truncated);
+        assert!(!payloads.is_empty() && payloads.len() < 20);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

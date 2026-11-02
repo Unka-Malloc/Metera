@@ -7,11 +7,12 @@
 //! The binding minted here names the codec as the source: one binding per
 //! agent codec, one epoch per collector run, scopes the host grants.
 
+use acativa::usage_ledger::LedgerError;
 use acop::SessionEntry;
-use acop_usage_source::TranscriptSource;
+use acop_usage_source::{ReadStats, TranscriptSource};
 use anyhow::{Context, Result};
 use token_usage_detector::SourceBinding;
-use token_usage_detector::collection::{MAX_BATCH_OBSERVATIONS, PublishBatch};
+use token_usage_detector::collection::PublishBatch;
 
 use crate::journal::{IngestReport, SourceAdmission};
 use crate::source_host::UsageSourceHost;
@@ -51,16 +52,28 @@ pub fn transcript_binding(
 /// payload carries what the host bound, never a second opinion about who
 /// produced it. Payloads publish in bounded chunks — a long session
 /// settles as several `usage.publish` batches, not one oversized frame.
-/// The settled ingest plus the store defects the read observed:
-/// `skipped_lines` stays visible to the caller — undecodable store lines
-/// are the store's defect, and silently swallowing them would read as
-/// "no usage".
+/// The settled ingest plus the store defects the read observed.
 #[derive(Debug)]
 pub struct TranscriptReport {
+    /// The journal-side result: accepted, refused, events and cursor.
     pub ingest: IngestReport,
+    /// Store lines the read could not decode — a store defect the caller
+    /// must see, since swallowing it would read as "no usage".
     pub skipped_lines: usize,
+    /// The session ran past the read's byte ceiling: the settled prefix
+    /// is explicitly partial, never silently complete.
+    pub truncated: bool,
 }
 
+/// Collect one session's declared counters into the journal.
+///
+/// The epoch and scope inside each payload are the admission's own: the
+/// payload carries what the host bound, never a second opinion about who
+/// produced it. Payloads publish in bounded chunks — a long session
+/// settles as several `usage.publish` batches, not one oversized frame.
+/// `skipped_lines` stays visible to the caller: undecodable store lines
+/// are the store's defect, and silently swallowing them would read as
+/// "no usage".
 pub fn collect_transcript_session(
     host: &mut UsageSourceHost,
     admission: &SourceAdmission,
@@ -69,34 +82,31 @@ pub fn collect_transcript_session(
     scope_ref: &str,
     fallback_observed_at: &str,
 ) -> Result<TranscriptReport> {
-    let collected = source
-        .collect(
+    let stats = std::cell::Cell::new(ReadStats::default());
+    let batches = source
+        .payload_batches(
             entry,
             &admission.binding().source_epoch,
             scope_ref,
             fallback_observed_at,
+            &stats,
         )
-        .with_context(|| format!("transcript collect `{}`", entry.session.id))?;
-    let mut merged = IngestReport {
-        source_ref: admission.binding().source_ref.clone(),
-        accepted: 0,
-        refused: Vec::new(),
-        events: Vec::new(),
-        cursor: None,
-    };
-    for chunk in collected.payloads.chunks(MAX_BATCH_OBSERVATIONS) {
-        let batch = PublishBatch::new(chunk.to_vec()).context("transcript publish batch")?;
-        let report = host
-            .publish(admission, &batch)
-            .context("transcript publish")?;
-        merged.accepted += report.accepted;
-        merged.refused.extend(report.refused);
-        merged.events.extend(report.events);
-        merged.cursor = report.cursor;
-    }
+        .map(|batch| {
+            batch
+                .map_err(|_| LedgerError::refused("acop.transcript", "transcript_read_failed"))
+                .and_then(|observations| {
+                    PublishBatch::new(observations)
+                        .map_err(|_| LedgerError::refused("acop.transcript", "batch_refused"))
+                })
+        });
+    let ingest = host
+        .publish_all(admission, batches)
+        .with_context(|| format!("transcript session `{}`", entry.session.id))?;
+    let stats = stats.get();
     Ok(TranscriptReport {
-        ingest: merged,
-        skipped_lines: collected.skipped_lines,
+        ingest,
+        skipped_lines: stats.skipped_lines,
+        truncated: stats.truncated,
     })
 }
 
@@ -107,6 +117,7 @@ mod tests {
     use acop::{CapabilityMatrix, Codec, HistoryRoot, TranscriptUsage, UsageTemporality};
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
+    use token_usage_detector::collection::MAX_BATCH_OBSERVATIONS;
 
     const SPEC: TranscriptUsage = TranscriptUsage {
         root: "synthetic-session-store",
@@ -193,6 +204,53 @@ mod tests {
         .expect("collect");
         assert_eq!(report.ingest.accepted, 1);
         assert_eq!(report.skipped_lines, 0);
+        assert!(!report.truncated);
+        assert!(report.ingest.refused.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_longer_than_one_batch_settles_in_one_publish() {
+        let dir = std::env::temp_dir().join(format!("metera-transcript-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let records = MAX_BATCH_OBSERVATIONS + 3;
+        let body: String = (0..records)
+            .map(|index| {
+                format!(
+                    "{{\"type\":\"usage_record\",\"payload\":{{\"usage\":{{\"input_tokens\":{index},\"output_tokens\":1}}}}}}\n"
+                )
+            })
+            .collect();
+        let session_path = dir.join("session-long.jsonl");
+        std::fs::write(&session_path, body).unwrap();
+        let entry = SessionEntry {
+            session: SessionRef {
+                id: "session-long".to_owned(),
+                path: session_path,
+                key: None,
+                parent: None,
+            },
+            kind: "synthetic-session-store",
+        };
+        let mut host =
+            UsageSourceHost::open(&json!({"stateRoot": dir.to_string_lossy()})).expect("host");
+        let binding = transcript_binding("synthetic", "pid-test", "epoch-1", &[TRANSCRIPT_SCOPE])
+            .expect("binding");
+        let admission = host.admit_source(
+            binding,
+            crate::journal::SettlementEligibility::SettlementEligible,
+        );
+        let source = TranscriptSource::of(&StubCodec).expect("spec declared");
+        let report = collect_transcript_session(
+            &mut host,
+            &admission,
+            &source,
+            &entry,
+            TRANSCRIPT_SCOPE,
+            "2026-11-02T00:00:00Z",
+        )
+        .expect("collect");
+        assert_eq!(report.ingest.accepted, records);
         assert!(report.ingest.refused.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

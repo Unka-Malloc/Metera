@@ -461,11 +461,16 @@ fn write_token_families(out: &mut String, projection: &FactProjection) -> bool {
     let mut tainted: BTreeSet<TokenKey> = projection.tainted.iter().map(&remap).collect();
     let mut totals: BTreeMap<TokenKey, ExactNumber> = BTreeMap::new();
     let mut unknown: BTreeMap<TokenKey, u64> = BTreeMap::new();
+    // Counted readings accumulated per merged key: when a merge taints a
+    // series — a pre-tainted raw key or an overflowing sum — every
+    // reading the merged total carried lands under unknown instead of
+    // vanishing with the dropped total.
+    let mut merged_counted: BTreeMap<TokenKey, u64> = BTreeMap::new();
     for (key, total) in &projection.totals {
         let merged = remap(key);
+        *merged_counted.entry(merged.clone()).or_default() +=
+            projection.counted.get(key).copied().unwrap_or(0);
         if tainted.contains(&merged) {
-            *unknown.entry(merged).or_default() +=
-                projection.counted.get(key).copied().unwrap_or(0);
             continue;
         }
         match totals.remove(&merged) {
@@ -474,14 +479,17 @@ fn write_token_families(out: &mut String, projection: &FactProjection) -> bool {
                     totals.insert(merged, sum);
                 }
                 None => {
-                    tainted.insert(merged.clone());
-                    *unknown.entry(merged).or_default() +=
-                        projection.counted.get(key).copied().unwrap_or(0);
+                    tainted.insert(merged);
                 }
             },
             None => {
                 totals.insert(merged, *total);
             }
+        }
+    }
+    for key in &tainted {
+        if let Some(count) = merged_counted.get(key) {
+            *unknown.entry(key.clone()).or_default() += count;
         }
     }
     for (key, count) in &projection.unknown {

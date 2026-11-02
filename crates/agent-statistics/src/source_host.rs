@@ -114,14 +114,17 @@ impl ReadingSettlement {
     }
 }
 
+/// Rendered exposition reuse: `((max, min) facts watermark, gateway
+/// fingerprint, text)`. A scrape re-renders when settlement writes,
+/// when the oldest served fact crosses the retention horizon, or when
+/// the gateway counters change.
+type ExpositionCache = std::sync::Mutex<Option<((i64, i64), u64, String)>>;
+
 /// The host's composition of the base journal over one resolved data home.
 pub struct UsageSourceHost {
     journal: UsageJournal,
     data_home: PathBuf,
-    /// Rendered exposition reuse: `(facts watermark, gateway fingerprint,
-    /// text)`. A scrape re-renders only when the journal's writes or the
-    /// gateway counters actually changed.
-    exposition_cache: std::sync::Mutex<Option<(i64, u64, String)>>,
+    exposition_cache: ExpositionCache,
 }
 
 impl std::fmt::Debug for UsageSourceHost {
@@ -204,6 +207,17 @@ impl UsageSourceHost {
         batch: &PublishBatch,
     ) -> LedgerResult<IngestReport> {
         UsageSourcePort::publish(&mut self.journal, admission, batch)
+    }
+
+    /// Settle a lazily-produced batch sequence in one transaction — a
+    /// session's observations commit once no matter how many bounded
+    /// batches its read produced.
+    pub fn publish_all(
+        &mut self,
+        admission: &SourceAdmission,
+        batches: impl IntoIterator<Item = LedgerResult<PublishBatch>>,
+    ) -> LedgerResult<IngestReport> {
+        self.journal.publish_all(admission, batches)
     }
 
     /// Settle one observation the host already bound.
@@ -943,5 +957,79 @@ mod tests {
             verbs.contains("crate::source_host::held_metering("),
             "the report verb must project the base ledger through the production owner"
         );
+    }
+
+    /// A cached exposition serves only while the journal's fact watermark
+    /// stands still: a new settlement re-renders, and a fact crossing the
+    /// retention horizon re-renders too — a cache hit can never keep
+    /// answering for a fact the retention bound just retired.
+    #[test]
+    fn a_cached_exposition_expires_with_the_facts_it_describes() {
+        let root = root("exposition-cache");
+        let mut host = UsageSourceHost::open(&params(&root)).expect("host");
+        let admission = admission("epoch-1");
+        host.publish(&admission, &batch(&[upsert("obs-1", 1, "7")]))
+            .expect("settled");
+
+        let renders = AtomicU64::new(0);
+        let render = |host: &UsageSourceHost| {
+            renders.fetch_add(1, Ordering::Relaxed);
+            Ok(format!("facts:{}", fact_rows(host)))
+        };
+        let first = host
+            .exposition_cached(0, |_| render(&host))
+            .expect("first render");
+        let second = host
+            .exposition_cached(0, |_| render(&host))
+            .expect("cached render");
+        assert_eq!(first, second);
+        assert_eq!(renders.load(Ordering::Relaxed), 1, "cache served the hit");
+
+        host.publish(&admission, &batch(&[upsert("obs-2", 1, "3")]))
+            .expect("settled");
+        host.exposition_cached(0, |_| render(&host))
+            .expect("re-render after write");
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            2,
+            "settlement moved the watermark"
+        );
+
+        // Age the rows past the retention horizon through a side
+        // connection: the watermark's own cutoff drops them from the
+        // served set, so the next lookup must not reuse the cached text.
+        let stale = {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            now - crate::journal::USAGE_JOURNAL_RETENTION_MS - 1
+        };
+        let connection = Connection::open(host.ledger_path()).expect("the ledger store");
+        connection
+            .execute(
+                "UPDATE usage_source_facts SET updated_at_ms=?1",
+                rusqlite::params![stale],
+            )
+            .expect("aged");
+        host.exposition_cached(0, |_| render(&host))
+            .expect("re-render after aging");
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            3,
+            "retirement moved the watermark"
+        );
+
+        // The watermark stands still but the gateway document changed:
+        // the folded-in counters are part of the cache key.
+        host.exposition_cached(1, |_| render(&host))
+            .expect("re-render on fingerprint change");
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            4,
+            "a gateway change re-renders on a still watermark"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

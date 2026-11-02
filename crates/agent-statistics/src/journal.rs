@@ -571,17 +571,81 @@ impl UsageJournal {
         Ok(())
     }
 
-    /// The newest fact-write instant in the store: expositions cache
-    /// against it, re-rendering only when settlement or retraction moves
-    /// it forward. Swept rows are already invisible to readers, so their
-    /// removal does not need to bump the watermark.
-    pub fn facts_watermark(&self) -> LedgerResult<i64> {
+    /// Settle a lazily-produced sequence of publish batches inside one
+    /// transaction: a session's observations commit once no matter how
+    /// many bounded batches its read produced. Batches pull in as the
+    /// transaction needs them — peak memory stays one batch — and a pull
+    /// or settlement failure drops the transaction with nothing
+    /// committed. Refused indexes count across the flattened delivery.
+    pub fn publish_all(
+        &mut self,
+        admission: &SourceAdmission,
+        batches: impl IntoIterator<Item = LedgerResult<PublishBatch>>,
+    ) -> LedgerResult<IngestReport> {
+        self.maybe_sweep_retention()?;
+        let transaction = self
+            .ledger
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| LedgerError::storage())?;
+        let mut refused = Vec::new();
+        let mut events = Vec::new();
+        let mut accepted = 0usize;
+        let mut flat_index = 0usize;
+        for batch in batches {
+            let batch = batch?;
+            for value in batch.observations() {
+                flat_index += 1;
+                match admission.binding.bind_value(value.clone(), None) {
+                    Err(failure) => refused.push(BatchRefusal {
+                        index: flat_index - 1,
+                        failure,
+                    }),
+                    Ok(bound) => match settle_event(&transaction, admission, &bound) {
+                        Ok(settlement) => {
+                            accepted += 1;
+                            events.push(settlement);
+                        }
+                        Err(error) if error.retryable => return Err(error),
+                        Err(error) => refused.push(BatchRefusal {
+                            index: flat_index - 1,
+                            failure: failure_from(error),
+                        }),
+                    },
+                }
+            }
+        }
+        let cursor = stored_cursor(
+            &transaction,
+            &admission.binding.source_ref,
+            &admission.binding.source_epoch,
+        )?
+        .map(|stored| stored.cursor);
+        transaction.commit().map_err(|_| LedgerError::storage())?;
+        Ok(IngestReport {
+            source_ref: admission.binding.source_ref.clone(),
+            accepted,
+            refused,
+            events,
+            cursor,
+        })
+    }
+
+    /// The newest and oldest served fact instants inside the retention
+    /// horizon. Expositions cache against the pair: the max moves when
+    /// settlement or retraction writes, the min moves when the oldest
+    /// served row crosses the horizon — so a cached text can never keep
+    /// answering for a fact the retention bound just retired.
+    pub fn facts_watermark(&self) -> LedgerResult<(i64, i64)> {
+        self.maybe_sweep_retention()?;
+        let cutoff = now_ms() - USAGE_JOURNAL_RETENTION_MS;
         self.ledger
             .connection
             .query_row(
-                "SELECT COALESCE(MAX(updated_at_ms),0) FROM usage_source_facts",
-                [],
-                |row| row.get(0),
+                "SELECT COALESCE(MAX(updated_at_ms),0), COALESCE(MIN(updated_at_ms),0)
+                 FROM usage_source_facts WHERE retracted=0 AND updated_at_ms>=?1",
+                params![cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|_| LedgerError::storage())
     }
@@ -1975,6 +2039,51 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].value.as_deref(), Some("5"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An expired set larger than one sweep batch still retires fully:
+    /// the batched delete repeats until the horizon holds no rows, never
+    /// one statement holding a WAL-sized transaction.
+    #[test]
+    fn a_sweep_past_one_batch_retires_every_expired_row() {
+        let root = root("sweep-batched");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let stale = now_ms() - USAGE_JOURNAL_RETENTION_MS - 1;
+        journal
+            .ledger
+            .connection
+            .execute(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
+                 INSERT INTO usage_source_facts
+                 SELECT 'aged:'||x,'scope','metric','1','tokens','reported','eligible',
+                        'src','epoch','obs:'||x,'2026-01-01T00:00:00Z',1,0,?2 FROM n",
+                params![(SWEEP_BATCH + 7) as i64, stale],
+            )
+            .expect("aged rows");
+        let fact_rows = |journal: &UsageJournal| -> i64 {
+            journal
+                .ledger
+                .connection
+                .query_row("SELECT COUNT(*) FROM usage_source_facts", [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+        };
+        assert_eq!(fact_rows(&journal), (SWEEP_BATCH + 7) as i64);
+
+        journal.last_sweep_ms.set(now_ms() - SWEEP_INTERVAL_MS - 1);
+        journal
+            .publish(
+                &source_admission("epoch-1", SettlementEligibility::SettlementEligible),
+                &batch(&[metric_upsert("fresh", 1, "5")]),
+            )
+            .expect("settled");
+
+        assert_eq!(fact_rows(&journal), 1);
+        let remaining = facts(&journal);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].value.as_deref(), Some("5"));
         let _ = fs::remove_dir_all(root);
     }
 
