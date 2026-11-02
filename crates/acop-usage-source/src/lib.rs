@@ -370,8 +370,11 @@ impl<'a> TranscriptSource<'a> {
     /// streaming walk and `collect_lines`. `line_ordinal` is the line's
     /// own position in the store — every line counts, including empty
     /// and undecodable ones — because settled observation ids carry it:
-    /// a rescan names the same records it named before, never a payload
-    /// rank that shifts when non-usage lines move.
+    /// The stability the id actually promises is bounded: an ordinal
+    /// survives its line changing between usage and non-usage content,
+    /// but stores are append-only artifacts — any insertion, removal or
+    /// reorder of a preceding line renumbers every record behind it and
+    /// a rescan settles those records under their new positions.
     fn project_line(
         &self,
         session_id: &str,
