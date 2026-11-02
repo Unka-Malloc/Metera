@@ -118,6 +118,7 @@ enum BatchState {
         reader: std::io::BufReader<std::fs::File>,
         bytes: u64,
         line_no: usize,
+        delimiter_pending: bool,
         pending: Vec<Value>,
     },
     Failed(Option<acop::Error>),
@@ -234,6 +235,7 @@ impl<'a> TranscriptSource<'a> {
                     reader: std::io::BufReader::new(file),
                     bytes: 0,
                     line_no: 0,
+                    delimiter_pending: false,
                     pending: Vec::new(),
                 },
                 Err(error) => BatchState::Failed(Some(acop::Error::io(&entry.session.path)(error))),
@@ -258,12 +260,29 @@ impl<'a> TranscriptSource<'a> {
                         reader,
                         bytes,
                         line_no,
+                        delimiter_pending,
                         pending,
                     } => {
                         let remaining = byte_ceiling.saturating_sub(*bytes);
                         if remaining == 0 {
-                            // The budget landed on a boundary: only real
-                            // bytes behind it mean the read stopped early.
+                            // A record projected at the exact boundary
+                            // left its `\n` delimiter unconsumed: swallow
+                            // it before judging — only real bytes behind
+                            // the budget mean the read stopped early.
+                            if *delimiter_pending {
+                                *delimiter_pending = false;
+                                match reader.fill_buf() {
+                                    Ok(available) if available.first() == Some(&b'\n') => {
+                                        reader.consume(1);
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        return Some(Err(acop::Error::io(&entry.session.path)(
+                                            error,
+                                        )));
+                                    }
+                                }
+                            }
                             match reader.fill_buf() {
                                 Ok(available) => {
                                     if !available.is_empty() {
@@ -301,7 +320,9 @@ impl<'a> TranscriptSource<'a> {
                             // budget cut mid-record: a partial record
                             // settles nothing.
                             match reader.fill_buf() {
-                                Ok(available) if available.first() == Some(&b'\n') => {}
+                                Ok(available) if available.first() == Some(&b'\n') => {
+                                    *delimiter_pending = true;
+                                }
                                 Ok(available) if !available.is_empty() => {
                                     let mut current = stats.get();
                                     current.truncated = true;
@@ -424,7 +445,11 @@ impl<'a> TranscriptSource<'a> {
     }
 
     /// The line-level projection [`collect`] applies, exposed for callers
-    /// holding session text already.
+    /// holding session text already. `lines` must supply *every* store
+    /// line in file order — including empty and undecodable ones — since
+    /// each line's own position is the settled observation identity; a
+    /// filtered list renumbers records and ids will not replay against
+    /// the streaming path or against previously settled facts.
     pub fn collect_lines(
         &self,
         session_id: &str,
@@ -983,6 +1008,36 @@ mod tests {
             .collect();
         assert_eq!(payloads.len(), 2);
         assert!(!stats.get().truncated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_single_record_ending_on_the_budget_is_complete_not_truncated() {
+        // The file's one record fills the budget and only its `\n`
+        // delimiter sits behind it: every record settles and the prefix
+        // is not partial.
+        let usage = "{\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":4}}}}\n";
+        let (dir, entry) = write_session(&[usage], "one.jsonl", "synthetic-session-store");
+        let stats = std::cell::Cell::new(ReadStats::default());
+        let payloads: Vec<Value> = source()
+            .payload_batches_up_to(
+                &entry,
+                "epoch",
+                "scope",
+                "2026-11-02T00:00:00Z",
+                &stats,
+                usage.len() as u64 - 1,
+            )
+            .collect::<acop::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(payloads.len(), 1);
+        assert!(
+            !stats.get().truncated,
+            "only the trailing delimiter was unread"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
