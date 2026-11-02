@@ -24,6 +24,7 @@ pub mod journal;
 pub mod normalize;
 pub mod persistence;
 pub mod source_host;
+pub mod transcript;
 pub mod variant;
 pub mod window;
 

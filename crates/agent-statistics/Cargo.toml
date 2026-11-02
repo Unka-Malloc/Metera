@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Local usage measurement, aggregation and metering journal engine: the usage journal, incremental projection, windowing, attribution, retained-report persistence, source-host composition and request counters."
 
 [dependencies]
+acop.workspace = true
+acop-usage-source.workspace = true
 token-usage-detector.workspace = true
 collection-store.workspace = true
 acativa.workspace = true

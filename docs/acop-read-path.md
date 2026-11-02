@@ -20,10 +20,14 @@ transport's facts; the store's facts stop at the counter object.
   absent — never zero, never `Quality::Reported` on a guess.
 - **No per-agent knowledge.** Adding an agent is adding a codec; this
   crate changes only if the canonical spec itself changes.
-- **Honest about unreadable.** Container-store sessions
-  (`SessionRef.key` set) refuse rather than line-read a database;
-  undecodable lines are counted in `skipped_lines`, not dropped
-  silently.
+- **Container stores read through the codec.** Sessions whose
+  `SessionRef.key` names a database row go through `decode_session`;
+  each canonical `meta` record's `{subtype, data}` is rewrapped as
+  `{type, payload}` so the spec's raw-record paths still resolve.
+  Undecodable input surfaces as `skipped_lines`, never as "no usage".
+- **Temporality is declared.** `TranscriptUsage.temporality` says
+  whether counters are per-record deltas or a running series — the
+  adapter never guesses which shape a field is.
 - **`includes` is set on shared subsets**: cached input inside input,
   input and output inside a reported total — so a total is never summed
   with its own parts.

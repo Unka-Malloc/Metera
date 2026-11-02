@@ -17,6 +17,15 @@ Both crates are the boundary layer, not clients: no network connections, no
 ledgers, no charges. Provider-specific acquisition lives in adapters above;
 accounting lives in the statistics consumer below.
 
+## Siblings
+
+`acop-usage-source` (and therefore `agent-statistics`' transcript
+collection) builds against one sibling checkout:
+
+| Path | Repository | Provides |
+| --- | --- | --- |
+| `../ACOP` | `Unka-Malloc/ACOP` | `acop` |
+
 ## Verify
 
 `scripts/verify.sh`

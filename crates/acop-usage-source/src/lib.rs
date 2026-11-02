@@ -18,7 +18,7 @@
 //! The adapter is strictly read-only: it opens session files, never writes
 //! to the store, and carries no ledger, no charge and no network surface.
 
-use acop::{Codec, Error, SessionEntry, StoreScan, TranscriptUsage, store};
+use acop::{Codec, SessionEntry, StoreScan, TranscriptUsage, UsageTemporality, store};
 use serde_json::{Value, json};
 use std::path::Path;
 use token_usage_detector::metrics;
@@ -37,12 +37,17 @@ fn counter_fields(usage: &TranscriptUsage) -> [(&'static str, &'static [&'static
 /// Timestamp fields raw transcript lines commonly carry; first present wins.
 const RECORD_TIME_FIELDS: &[&str] = &["timestamp", "ts", "time", "created_at"];
 
-/// The wire shape one counter record produces.
-fn counter_metric(value: impl Into<String>) -> Value {
+/// The wire shape one counter record produces; the temporality is the
+/// store's own declaration, never inferred here.
+fn counter_metric(value: impl Into<String>, temporality: UsageTemporality) -> Value {
+    let temporality = match temporality {
+        UsageTemporality::Delta => "delta",
+        UsageTemporality::Cumulative => "cumulative",
+    };
     json!({
         "value": value.into(),
         "unit": "tokens",
-        "temporality": "delta",
+        "temporality": temporality,
         "quality": "reported",
     })
 }
@@ -94,11 +99,14 @@ impl<'a> TranscriptSource<'a> {
         Ok(scan)
     }
 
-    /// Read one file-backed session and emit every counter record's payload.
+    /// Read one session and emit every counter record's payload.
     ///
-    /// Container-store sessions (`session.key` set) are refused rather than
-    /// silently emptied: reading a database file as lines would look like
-    /// "no usage" instead of "not readable this way".
+    /// File-backed sessions are line-read with the spec applied verbatim.
+    /// Container-backed sessions (`session.key` set — a database row, not
+    /// a file) go through the codec's `decode_session` instead: each
+    /// canonical `meta` record's `{subtype, data}` is rewrapped as
+    /// `{type, payload}` so the spec's raw-record paths still resolve —
+    /// the codec stays the only authority on how a row becomes a record.
     pub fn collect(
         &self,
         entry: &SessionEntry,
@@ -107,13 +115,10 @@ impl<'a> TranscriptSource<'a> {
         fallback_observed_at: &str,
     ) -> acop::Result<Collected> {
         if entry.session.key.is_some() {
-            return Err(Error::Usage(format!(
-                "session `{}` is container-backed; line reading does not apply",
-                entry.session.id
-            )));
+            return self.collect_decoded(entry, source_epoch, scope_ref, fallback_observed_at);
         }
-        let text =
-            std::fs::read_to_string(&entry.session.path).map_err(Error::io(&entry.session.path))?;
+        let text = std::fs::read_to_string(&entry.session.path)
+            .map_err(acop::Error::io(&entry.session.path))?;
         Ok(self.collect_lines(
             &entry.session.id,
             text.lines(),
@@ -121,6 +126,43 @@ impl<'a> TranscriptSource<'a> {
             scope_ref,
             fallback_observed_at,
         ))
+    }
+
+    /// The container-store path: canonical records out of `decode_session`,
+    /// meta bodies rewrapped into the raw shape the spec's paths name.
+    fn collect_decoded(
+        &self,
+        entry: &SessionEntry,
+        source_epoch: &str,
+        scope_ref: &str,
+        fallback_observed_at: &str,
+    ) -> acop::Result<Collected> {
+        let decoded = self.codec.decode_session(&entry.session)?;
+        let mut payloads = Vec::new();
+        for record in &decoded.conversation.records {
+            let acop::Body::Meta { subtype, data } = &record.body else {
+                continue;
+            };
+            let raw = json!({"type": subtype, "payload": data});
+            let Some(metrics) = self.counters(&raw) else {
+                continue;
+            };
+            let observed_at = record.ts.as_deref().unwrap_or(fallback_observed_at);
+            payloads.push(json!({
+                "schema": wire::USAGE,
+                "observationId": observation_id(&entry.session.id, record.ordinal as usize),
+                "revision": 1,
+                "operation": "upsert",
+                "sourceEpoch": source_epoch,
+                "scopeRef": scope_ref,
+                "observedAt": observed_at,
+                "metrics": metrics,
+            }));
+        }
+        Ok(Collected {
+            payloads,
+            skipped_lines: decoded.skipped.len(),
+        })
     }
 
     /// The line-level projection [`collect`] applies, exposed for callers
@@ -183,7 +225,10 @@ impl<'a> TranscriptSource<'a> {
                 .iter()
                 .find_map(|field| counter_value(container, field))
             {
-                metrics.insert((*metric).to_owned(), counter_metric(value));
+                metrics.insert(
+                    (*metric).to_owned(),
+                    counter_metric(value, self.usage.temporality),
+                );
             }
         }
         if metrics.is_empty() {
@@ -233,6 +278,7 @@ mod tests {
         cached: &["cached_input_tokens"],
         output: &["output_tokens"],
         total: &[],
+        temporality: UsageTemporality::Delta,
     };
 
     fn source() -> TranscriptSource<'static> {

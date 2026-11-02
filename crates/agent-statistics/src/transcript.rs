@@ -1,0 +1,188 @@
+//! Agent-side transcript collection wired through the standard source
+//! entry: `acop-usage-source` reads declared counters out of ACOP
+//! transcripts, and this module pushes the resulting payloads through
+//! `usage.publish` exactly like any other source — bound by the host's
+//! admission, never self-asserted.
+//!
+//! The binding minted here names the codec as the source: one binding per
+//! agent codec, one epoch per collector run, scopes the host grants.
+
+use acop::SessionEntry;
+use acop_usage_source::TranscriptSource;
+use anyhow::{Context, Result};
+use token_usage_detector::SourceBinding;
+use token_usage_detector::collection::{MAX_BATCH_OBSERVATIONS, PublishBatch};
+
+use crate::journal::{IngestReport, SourceAdmission};
+use crate::source_host::UsageSourceHost;
+
+/// The extension id transcript collection settles under — one logical
+/// producer no matter which codec read the store.
+pub const TRANSCRIPT_EXTENSION_ID: &str = "acop.transcript";
+
+/// The scope transcript observations settle under: the aggregate range a
+/// host grants when it collects agent-side counters.
+pub const TRANSCRIPT_SCOPE: &str = "agent:transcripts";
+
+/// The binding one codec's transcript collection presents — the source
+/// identity names the codec so facts stay attributable to the store they
+/// came from; epoch and scopes are the host's facts, supplied by the
+/// caller the way the transport would.
+pub fn transcript_binding(
+    codec_id: &str,
+    instance_id: &str,
+    source_epoch: &str,
+    scope_grants: &[&str],
+) -> Result<SourceBinding> {
+    SourceBinding::new(
+        format!("source:acop-transcript#{codec_id}"),
+        TRANSCRIPT_EXTENSION_ID,
+        instance_id,
+        1,
+        source_epoch,
+        scope_grants.iter().copied(),
+    )
+    .context("transcript source binding")
+}
+
+/// Collect one session's declared counters into the journal.
+///
+/// The epoch and scope inside each payload are the admission's own: the
+/// payload carries what the host bound, never a second opinion about who
+/// produced it. Payloads publish in bounded chunks — a long session
+/// settles as several `usage.publish` batches, not one oversized frame.
+/// `skipped_lines` stays visible to the caller: undecodable store lines
+/// are the store's defect, and silently swallowing them would read as
+/// "no usage".
+pub fn collect_transcript_session(
+    host: &mut UsageSourceHost,
+    admission: &SourceAdmission,
+    source: &TranscriptSource<'_>,
+    entry: &SessionEntry,
+    scope_ref: &str,
+    fallback_observed_at: &str,
+) -> Result<IngestReport> {
+    let collected = source
+        .collect(
+            entry,
+            &admission.binding().source_epoch,
+            scope_ref,
+            fallback_observed_at,
+        )
+        .with_context(|| format!("transcript collect `{}`", entry.session.id))?;
+    let mut merged = IngestReport {
+        source_ref: admission.binding().source_ref.clone(),
+        accepted: 0,
+        refused: Vec::new(),
+        events: Vec::new(),
+        cursor: None,
+    };
+    for chunk in collected.payloads.chunks(MAX_BATCH_OBSERVATIONS) {
+        let batch = PublishBatch::new(chunk.to_vec()).context("transcript publish batch")?;
+        let report = host
+            .publish(admission, &batch)
+            .context("transcript publish")?;
+        merged.accepted += report.accepted;
+        merged.refused.extend(report.refused);
+        merged.events.extend(report.events);
+        merged.cursor = report.cursor;
+    }
+    Ok(merged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acop::codec::SessionRef;
+    use acop::{CapabilityMatrix, Codec, HistoryRoot, TranscriptUsage, UsageTemporality};
+    use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
+
+    const SPEC: TranscriptUsage = TranscriptUsage {
+        root: "synthetic-session-store",
+        record: Some(("type", "usage_record")),
+        container: "payload.usage",
+        input: &["input_tokens"],
+        cached: &[],
+        output: &["output_tokens"],
+        total: &[],
+        temporality: UsageTemporality::Delta,
+    };
+
+    struct StubCodec;
+    impl Codec for StubCodec {
+        fn id(&self) -> &'static str {
+            "synthetic"
+        }
+        fn history(&self) -> Vec<HistoryRoot> {
+            Vec::new()
+        }
+        fn session_kinds(&self) -> &'static [&'static str] {
+            &["synthetic-session-store"]
+        }
+        fn capabilities(&self) -> &'static CapabilityMatrix {
+            &CapabilityMatrix::READ_ONLY
+        }
+        fn transcript_usage(&self) -> Option<TranscriptUsage> {
+            Some(SPEC)
+        }
+        fn decode(&self, _path: &Path) -> acop::Result<acop::codec::Decoded> {
+            unreachable!("file-backed sessions are line-read")
+        }
+        fn encode(&self, _conversation: &acop::Conversation) -> acop::Result<acop::codec::Encoded> {
+            unreachable!("read-only")
+        }
+        fn store_path(
+            &self,
+            _home: &Path,
+            _conversation: &acop::Conversation,
+        ) -> acop::Result<PathBuf> {
+            unreachable!("read-only")
+        }
+        fn redact_line(&self, _line: &Value, _pattern: &str) -> Option<Value> {
+            unreachable!("read-only")
+        }
+    }
+
+    #[test]
+    fn transcript_counters_settle_into_the_journal() {
+        let dir = std::env::temp_dir().join(format!("metera-transcript-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session_path = dir.join("session-1.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"usage_record\",\"payload\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":4}}}\n",
+        )
+        .unwrap();
+        let entry = SessionEntry {
+            session: SessionRef {
+                id: "session-1".to_owned(),
+                path: session_path,
+                key: None,
+                parent: None,
+            },
+            kind: "synthetic-session-store",
+        };
+        let mut host =
+            UsageSourceHost::open(&json!({"stateRoot": dir.to_string_lossy()})).expect("host");
+        let binding = transcript_binding("synthetic", "pid-test", "epoch-1", &[TRANSCRIPT_SCOPE])
+            .expect("binding");
+        let admission = host.admit_source(
+            binding,
+            crate::journal::SettlementEligibility::SettlementEligible,
+        );
+        let source = TranscriptSource::of(&StubCodec).expect("spec declared");
+        let report = collect_transcript_session(
+            &mut host,
+            &admission,
+            &source,
+            &entry,
+            TRANSCRIPT_SCOPE,
+            "2026-11-02T00:00:00Z",
+        )
+        .expect("collect");
+        assert_eq!(report.accepted, 1);
+        assert!(report.refused.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

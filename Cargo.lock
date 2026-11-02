@@ -52,6 +52,8 @@ name = "agent-statistics"
 version = "0.2.0"
 dependencies = [
  "acativa",
+ "acop",
+ "acop-usage-source",
  "anyhow",
  "collection-store",
  "rusqlite",

@@ -16,6 +16,7 @@ repository = "https://github.com/Unka-Malloc/Metera"
 
 [workspace.dependencies]
 acop = { path = "../ACOP/crates/acop", version = "0.1.2" }
+acop-usage-source = { path = "crates/acop-usage-source", version = "0.1.0" }
 token-usage-detector = { path = "crates/token-usage-detector", version = "0.2.1" }
 collection-store = { path = "crates/collection-store", version = "0.1.0" }
 # The flywheel owns the graph-run usage store this crate's journal shares.
