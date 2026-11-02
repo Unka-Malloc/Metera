@@ -15,7 +15,10 @@
 //!
 //! - **Unknown stays unwritten.** A retained fact carrying no value emits no
 //!   sample; it is counted under `metera_usage_unknown_facts` instead, so a
-//!   scrape can never turn "nobody knows" into "nothing was used".
+//!   scrape can never turn "nobody knows" into "nothing was used". A tainted
+//!   series — an unparseable or overflowing reading withdrew its total —
+//!   reports its summed readings there too: a total that cannot be published
+//!   never pretends its readings vanished.
 //! - **Sums stay exact.** Token totals add through the published
 //!   [`ExactNumber`] decimal, never binary floating point; what the text
 //!   carries is what the store wrote.
@@ -520,7 +523,7 @@ fn write_token_families(out: &mut String, projection: &FactProjection) -> bool {
         header(
             out,
             "metera_usage_unknown_facts",
-            "Retained readings the producer did not count, by host-bound source, model and token kind.",
+            "Retained readings with no published total — uncounted by the producer or withdrawn with a tainted series — by host-bound source, model and token kind.",
             "gauge",
         );
         for ((source, model, kind), count) in unknown.iter().take(MAX_EXPORTED_SERIES) {
@@ -692,7 +695,7 @@ metera_gateway_model_requests_total{day=\"2026-07-15\",model=\"kimi-k2\"} 3
 # TYPE metera_usage_tokens gauge
 metera_usage_tokens{kind=\"input\",model=\"kimi-k2\",source=\"native:codex\"} 175.50
 metera_usage_tokens{kind=\"output\",model=\"kimi-k2\",source=\"native:codex\"} 20
-# HELP metera_usage_unknown_facts Retained readings the producer did not count, by host-bound source, model and token kind.
+# HELP metera_usage_unknown_facts Retained readings with no published total — uncounted by the producer or withdrawn with a tainted series — by host-bound source, model and token kind.
 # TYPE metera_usage_unknown_facts gauge
 metera_usage_unknown_facts{kind=\"total\",model=\"kimi-k2\",source=\"native:codex\"} 1
 # EOF

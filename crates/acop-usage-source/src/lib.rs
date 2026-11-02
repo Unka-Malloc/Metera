@@ -117,7 +117,7 @@ enum BatchState {
     Lines {
         reader: std::io::BufReader<std::fs::File>,
         bytes: u64,
-        line_no: usize,
+        produced: usize,
         pending: Vec<Value>,
     },
     Failed(Option<acop::Error>),
@@ -233,7 +233,7 @@ impl<'a> TranscriptSource<'a> {
                 Ok(file) => BatchState::Lines {
                     reader: std::io::BufReader::new(file),
                     bytes: 0,
-                    line_no: 0,
+                    produced: 0,
                     pending: Vec::new(),
                 },
                 Err(error) => BatchState::Failed(Some(acop::Error::io(&entry.session.path)(error))),
@@ -257,7 +257,7 @@ impl<'a> TranscriptSource<'a> {
                     BatchState::Lines {
                         reader,
                         bytes,
-                        line_no,
+                        produced,
                         pending,
                     } => {
                         let remaining = byte_ceiling.saturating_sub(*bytes);
@@ -279,7 +279,7 @@ impl<'a> TranscriptSource<'a> {
                             }
                         }
                         let mut raw = Vec::new();
-                        let read = match std::io::Read::take(&mut *reader, remaining + 1)
+                        let read = match std::io::Read::take(&mut *reader, remaining)
                             .read_until(b'\n', &mut raw)
                         {
                             Ok(read) => read,
@@ -291,16 +291,24 @@ impl<'a> TranscriptSource<'a> {
                         if read == 0 {
                             return flush(pending);
                         }
-                        if raw.last() != Some(&b'\n') && read as u64 > remaining {
-                            // The budget cut mid-line: a partial record
-                            // settles nothing — stop and mark the prefix.
-                            let mut current = stats.get();
-                            current.truncated = true;
-                            stats.set(current);
-                            return flush(pending);
+                        if raw.last() != Some(&b'\n') && read as u64 == remaining {
+                            // The budget may have cut mid-line — peek:
+                            // real bytes behind it mean the record is
+                            // partial and the emitted prefix is truncated.
+                            match reader.fill_buf() {
+                                Ok(available) if !available.is_empty() => {
+                                    let mut current = stats.get();
+                                    current.truncated = true;
+                                    stats.set(current);
+                                    return flush(pending);
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    return Some(Err(acop::Error::io(&entry.session.path)(error)));
+                                }
+                            }
                         }
-                        let ordinal = *line_no;
-                        *line_no += 1;
+                        let ordinal = *produced;
                         let line = String::from_utf8_lossy(&raw);
                         match self.project_line(
                             session_id,
@@ -311,6 +319,7 @@ impl<'a> TranscriptSource<'a> {
                             fallback_observed_at,
                         ) {
                             LineProjection::Payload(payload) => {
+                                *produced += 1;
                                 pending.push(payload);
                                 if pending.len() >= MAX_BATCH_OBSERVATIONS {
                                     return Some(Ok(std::mem::take(pending)));
@@ -331,9 +340,9 @@ impl<'a> TranscriptSource<'a> {
 
     /// The spec applied to one raw store line: the projection every read
     /// path shares, so identities and payloads cannot drift between the
-    /// streaming walk and `collect_lines`. `ordinal` is the line's own
-    /// position in the store — settled observation ids carry it, so a
-    /// rescan names the same records it named before.
+    /// streaming walk and `collect_lines`. `ordinal` is the record's
+    /// position among the session's usage payloads — settled observation
+    /// ids carry it, so a rescan names the same records it named before.
     fn project_line(
         &self,
         session_id: &str,
@@ -418,10 +427,10 @@ impl<'a> TranscriptSource<'a> {
     ) -> Collected {
         let mut payloads = Vec::new();
         let mut skipped_lines = 0;
-        for (index, line) in lines.enumerate() {
+        for line in lines {
             match self.project_line(
                 session_id,
-                index,
+                payloads.len(),
                 line.as_ref().trim(),
                 source_epoch,
                 scope_ref,

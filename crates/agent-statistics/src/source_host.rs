@@ -209,9 +209,12 @@ impl UsageSourceHost {
         UsageSourcePort::publish(&mut self.journal, admission, batch)
     }
 
-    /// Settle a lazily-produced batch sequence in one transaction — a
-    /// session's observations commit once no matter how many bounded
-    /// batches its read produced.
+    /// Settle a lazily-produced batch sequence at a bounded commit
+    /// cadence: every batch commits in its own transaction, so a
+    /// mid-sequence failure stops the read with every earlier batch
+    /// already durable — never rolled back. Refused indexes count across
+    /// the flattened delivery; `events` keeps only the leading batch's
+    /// settlements since a session's full event list is unbounded.
     pub fn publish_all(
         &mut self,
         admission: &SourceAdmission,
@@ -1004,6 +1007,27 @@ mod tests {
         )
         .expect("recorded");
 
+        // Cache-hit and fingerprint paths, observed directly: a still
+        // watermark serves the cached text, a changed gateway document
+        // re-renders even while nothing settled.
+        let renders = AtomicU64::new(0);
+        let counted = |host: &UsageSourceHost, fingerprint: u64| {
+            host.exposition_cached(fingerprint, |_| {
+                renders.fetch_add(1, Ordering::Relaxed);
+                Ok(String::new())
+            })
+            .expect("render")
+        };
+        counted(&host, 0);
+        counted(&host, 0);
+        assert_eq!(renders.load(Ordering::Relaxed), 1, "cache served the hit");
+        counted(&host, 7);
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            2,
+            "a gateway fingerprint change re-renders on a still watermark"
+        );
+
         let rendered = |host: &UsageSourceHost| crate::export::render(host, None).expect("render");
         let first = rendered(&host);
         assert!(first.contains("model-old"));
@@ -1041,13 +1065,16 @@ mod tests {
         );
         assert!(aged.contains("model-new"), "the newer series remains");
 
-        // A retraction moves the watermark too: the withdrawn reading
-        // cannot keep publishing through a cached render.
-        host.retract(
-            "native:test",
-            "agent:test#reading:2026-07-14:model-new#licoup.tokens.output",
-        )
-        .expect("retracted");
+        // A retraction moves the watermark too — retract through a side
+        // connection so the in-process cache clear cannot mask the store
+        // key: the withdrawn reading cannot keep publishing.
+        connection
+            .execute(
+                "UPDATE usage_source_facts SET retracted=1, updated_at_ms=?1
+                 WHERE fact_id LIKE '%model-new%'",
+                rusqlite::params![now + 60_000],
+            )
+            .expect("retracted");
         let withdrawn = rendered(&host);
         assert!(
             !withdrawn.contains("model-new"),

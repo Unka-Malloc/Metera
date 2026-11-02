@@ -2080,6 +2080,42 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A mid-sequence failure stops the delivery with every earlier batch
+    /// already durable — a rerun then replays the settled half instead of
+    /// double-counting it.
+    #[test]
+    fn a_failed_batch_mid_sequence_keeps_the_committed_prefix() {
+        let root = root("publish-all-midfail");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        let first = batch(&[
+            metric_upsert("obs-1", 1, "1"),
+            metric_upsert("obs-2", 1, "2"),
+        ]);
+        let result = journal.publish_all(&admission, vec![Ok(first), Err(LedgerError::storage())]);
+        assert!(result.is_err());
+        assert_eq!(facts(&journal).len(), 2, "the committed prefix stays");
+
+        // Redelivering the session replays the settled observations and
+        // settles only the remainder — and the report never carries more
+        // events than one batch holds.
+        let report = journal
+            .publish_all(
+                &admission,
+                vec![
+                    Ok(batch(&[
+                        metric_upsert("obs-1", 1, "1"),
+                        metric_upsert("obs-2", 1, "2"),
+                    ])),
+                    Ok(batch(&[metric_upsert("obs-3", 1, "3")])),
+                ],
+            )
+            .expect("settled");
+        assert_eq!(facts(&journal).len(), 3);
+        assert!(report.events.len() <= MAX_BATCH_OBSERVATIONS);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_held_open_read_only_journal_enforces_the_horizon() {
         let root = root("sweep-read");

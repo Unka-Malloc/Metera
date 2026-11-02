@@ -78,6 +78,10 @@ pub fn collect_transcript_session(
     fallback_observed_at: &str,
 ) -> Result<TranscriptReport> {
     let stats = std::cell::Cell::new(ReadStats::default());
+    // The codec's own error (path and cause) rides the report's context
+    // through this cell — the ledger surface itself carries only the
+    // refusal vocabulary, never a filesystem path.
+    let read_cause = std::cell::RefCell::new(None::<acop::Error>);
     let batches = source
         .payload_batches(
             entry,
@@ -88,14 +92,28 @@ pub fn collect_transcript_session(
         )
         .map(|batch| {
             batch
-                .map_err(|error| LedgerError {
-                    code: "transcript_read_failed".into(),
-                    stage: "acop.transcript".into(),
-                    // A store read can fail transiently like any storage
-                    // call — retryable, with the codec's own error (path
-                    // and cause) kept on the report.
-                    retryable: true,
-                    recovery: format!("{error}"),
+                .map_err(|error| {
+                    // A missing or unreadable store is a permanent input
+                    // defect; a mid-read io failure is transient like any
+                    // storage call.
+                    let retryable = match &error {
+                        acop::Error::Io { source, .. } => !matches!(
+                            source.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                        ),
+                        _ => false,
+                    };
+                    let recovery = match retryable {
+                        true => "retry_after_store_recovers",
+                        false => "correct_request_and_retry",
+                    };
+                    *read_cause.borrow_mut() = Some(error);
+                    LedgerError {
+                        code: "transcript_read_failed".into(),
+                        stage: "acop.transcript".into(),
+                        retryable,
+                        recovery: recovery.into(),
+                    }
                 })
                 .and_then(|observations| {
                     PublishBatch::new(observations).map_err(|_| {
@@ -103,9 +121,16 @@ pub fn collect_transcript_session(
                     })
                 })
         });
-    let ingest = host
-        .publish_all(admission, batches)
-        .with_context(|| format!("transcript session `{}`", entry.session.id))?;
+    let ingest = match host.publish_all(admission, batches) {
+        Ok(report) => report,
+        Err(error) => match read_cause.borrow_mut().take() {
+            Some(cause) => return Err(anyhow::Error::new(error).context(format!("{cause}"))),
+            None => {
+                return Err(error)
+                    .with_context(|| format!("transcript session `{}`", entry.session.id));
+            }
+        },
+    };
     let stats = stats.get();
     Ok(TranscriptReport {
         ingest,
