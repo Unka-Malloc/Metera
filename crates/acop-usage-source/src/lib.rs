@@ -117,7 +117,7 @@ enum BatchState {
     Lines {
         reader: std::io::BufReader<std::fs::File>,
         bytes: u64,
-        produced: usize,
+        line_no: usize,
         pending: Vec<Value>,
     },
     Failed(Option<acop::Error>),
@@ -233,7 +233,7 @@ impl<'a> TranscriptSource<'a> {
                 Ok(file) => BatchState::Lines {
                     reader: std::io::BufReader::new(file),
                     bytes: 0,
-                    produced: 0,
+                    line_no: 0,
                     pending: Vec::new(),
                 },
                 Err(error) => BatchState::Failed(Some(acop::Error::io(&entry.session.path)(error))),
@@ -257,7 +257,7 @@ impl<'a> TranscriptSource<'a> {
                     BatchState::Lines {
                         reader,
                         bytes,
-                        produced,
+                        line_no,
                         pending,
                     } => {
                         let remaining = byte_ceiling.saturating_sub(*bytes);
@@ -292,10 +292,16 @@ impl<'a> TranscriptSource<'a> {
                             return flush(pending);
                         }
                         if raw.last() != Some(&b'\n') && read as u64 == remaining {
-                            // The budget may have cut mid-line — peek:
-                            // real bytes behind it mean the record is
-                            // partial and the emitted prefix is truncated.
+                            // The budget ended exactly on a record: peek
+                            // for the byte behind it. A newline means the
+                            // record text is complete and only its
+                            // delimiter sits outside the budget — project
+                            // it and let the next loop's empty budget
+                            // mark the prefix. Anything else means the
+                            // budget cut mid-record: a partial record
+                            // settles nothing.
                             match reader.fill_buf() {
+                                Ok(available) if available.first() == Some(&b'\n') => {}
                                 Ok(available) if !available.is_empty() => {
                                     let mut current = stats.get();
                                     current.truncated = true;
@@ -308,7 +314,8 @@ impl<'a> TranscriptSource<'a> {
                                 }
                             }
                         }
-                        let ordinal = *produced;
+                        let ordinal = *line_no;
+                        *line_no += 1;
                         let line = String::from_utf8_lossy(&raw);
                         match self.project_line(
                             session_id,
@@ -319,7 +326,6 @@ impl<'a> TranscriptSource<'a> {
                             fallback_observed_at,
                         ) {
                             LineProjection::Payload(payload) => {
-                                *produced += 1;
                                 pending.push(payload);
                                 if pending.len() >= MAX_BATCH_OBSERVATIONS {
                                     return Some(Ok(std::mem::take(pending)));
@@ -340,13 +346,15 @@ impl<'a> TranscriptSource<'a> {
 
     /// The spec applied to one raw store line: the projection every read
     /// path shares, so identities and payloads cannot drift between the
-    /// streaming walk and `collect_lines`. `ordinal` is the record's
-    /// position among the session's usage payloads — settled observation
-    /// ids carry it, so a rescan names the same records it named before.
+    /// streaming walk and `collect_lines`. `line_ordinal` is the line's
+    /// own position in the store — every line counts, including empty
+    /// and undecodable ones — because settled observation ids carry it:
+    /// a rescan names the same records it named before, never a payload
+    /// rank that shifts when non-usage lines move.
     fn project_line(
         &self,
         session_id: &str,
-        ordinal: usize,
+        line_ordinal: usize,
         line: &str,
         source_epoch: &str,
         scope_ref: &str,
@@ -367,7 +375,7 @@ impl<'a> TranscriptSource<'a> {
             .unwrap_or(fallback_observed_at);
         LineProjection::Payload(json!({
             "schema": wire::USAGE,
-            "observationId": observation_id(session_id, ordinal),
+            "observationId": observation_id(session_id, line_ordinal),
             "revision": 1,
             "operation": "upsert",
             "sourceEpoch": source_epoch,
@@ -427,10 +435,10 @@ impl<'a> TranscriptSource<'a> {
     ) -> Collected {
         let mut payloads = Vec::new();
         let mut skipped_lines = 0;
-        for line in lines {
+        for (index, line) in lines.enumerate() {
             match self.project_line(
                 session_id,
-                payloads.len(),
+                index,
                 line.as_ref().trim(),
                 source_epoch,
                 scope_ref,
@@ -810,7 +818,9 @@ mod tests {
 
     #[test]
     fn reads_stop_at_the_byte_ceiling_and_mark_the_prefix_partial() {
-        let dir = std::env::temp_dir().join(format!("acop-usage-src-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("acop-usage-src-{}", std::process::id()))
+            .join("ceiling");
         std::fs::create_dir_all(&dir).unwrap();
         let line = "{\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":2,\"output_tokens\":1}}}}\n";
         let path = dir.join("session.jsonl");
@@ -843,6 +853,136 @@ mod tests {
         let stats = stats.get();
         assert!(stats.truncated);
         assert!(!payloads.is_empty() && payloads.len() < 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_session(
+        lines: &[&str],
+        name: &str,
+        kind: &'static str,
+    ) -> (std::path::PathBuf, SessionEntry) {
+        let dir = std::env::temp_dir()
+            .join(format!("acop-usage-src-{}", std::process::id()))
+            .join(name.trim_end_matches(".jsonl"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, lines.concat()).unwrap();
+        (
+            dir,
+            SessionEntry {
+                session: acop::codec::SessionRef {
+                    id: "parity".to_owned(),
+                    path,
+                    key: None,
+                    parent: None,
+                },
+                kind,
+            },
+        )
+    }
+
+    #[test]
+    fn streamed_ids_match_collect_lines_regardless_of_record_shape() {
+        // Meta and mirror lines interleave with usage records; the settled
+        // identity is the line's own position — the same ids
+        // `collect_lines` names them.
+        let session_lines = [
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"p\"}}\n",
+            "{\"type\":\"token_usage_record\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1}}}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{}}}}\n",
+            "{\"type\":\"token_usage_record\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":2}}}}\n",
+        ];
+        let (dir, entry) = write_session(&session_lines, "parity.jsonl", "codex-sessions");
+        let codex = TranscriptSource {
+            codec: &NeverCodec,
+            usage: CODEX_SPEC,
+        };
+        let collected = codex.collect_lines(
+            "parity",
+            session_lines.iter().map(|line| line.trim_end()),
+            "epoch",
+            "scope",
+            "2026-11-02T00:00:00Z",
+        );
+        let expected: Vec<String> = collected
+            .payloads
+            .iter()
+            .map(|payload| payload["observationId"].as_str().unwrap().to_owned())
+            .collect();
+        let stats = std::cell::Cell::new(ReadStats::default());
+        let streamed: Vec<String> = codex
+            .payload_batches_up_to(
+                &entry,
+                "epoch",
+                "scope",
+                "2026-11-02T00:00:00Z",
+                &stats,
+                u64::MAX,
+            )
+            .collect::<acop::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|payload| payload["observationId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(streamed, expected);
+        assert_eq!(streamed, vec!["parity#1", "parity#3"]);
+        assert!(!stats.get().truncated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_filling_the_budget_with_newline_behind_still_settles() {
+        // The JSON text ends exactly at the ceiling and only its `\n`
+        // delimiter sits outside it — the record is complete and projects.
+        let usage = "{\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":2}}}}\n";
+        let (dir, entry) = write_session(
+            &[usage, usage, usage],
+            "exact.jsonl",
+            "synthetic-session-store",
+        );
+        let stats = std::cell::Cell::new(ReadStats::default());
+        let payloads: Vec<Value> = source()
+            .payload_batches_up_to(
+                &entry,
+                "epoch",
+                "scope",
+                "2026-11-02T00:00:00Z",
+                &stats,
+                usage.len() as u64 - 1, // budget ends on the record's last byte
+            )
+            .collect::<acop::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(payloads.len(), 1);
+        assert!(stats.get().truncated, "further bytes sit behind the line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_ending_exactly_at_the_budget_is_not_truncated() {
+        let usage = "{\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":3}}}}\n";
+        let two = [usage, usage];
+        let (dir, entry) = write_session(&two, "ends.jsonl", "synthetic-session-store");
+        let stats = std::cell::Cell::new(ReadStats::default());
+        let payloads: Vec<Value> = source()
+            .payload_batches_up_to(
+                &entry,
+                "epoch",
+                "scope",
+                "2026-11-02T00:00:00Z",
+                &stats,
+                usage.len() as u64 * 2,
+            )
+            .collect::<acop::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(payloads.len(), 2);
+        assert!(!stats.get().truncated);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,8 +11,8 @@ use acativa::usage_ledger::LedgerError;
 use acop::SessionEntry;
 use acop_usage_source::{ReadStats, TranscriptSource};
 use anyhow::{Context, Result};
-use token_usage_detector::SourceBinding;
 use token_usage_detector::collection::PublishBatch;
+use token_usage_detector::{RecoveryAction, SourceBinding};
 
 use crate::journal::{IngestReport, SourceAdmission};
 use crate::source_host::UsageSourceHost;
@@ -103,16 +103,16 @@ pub fn collect_transcript_session(
                         ),
                         _ => false,
                     };
-                    let recovery = match retryable {
-                        true => "retry_after_store_recovers",
-                        false => "correct_request_and_retry",
+                    let action = match retryable {
+                        true => RecoveryAction::RetryAfterRecovery,
+                        false => RecoveryAction::CorrectRequest,
                     };
                     *read_cause.borrow_mut() = Some(error);
                     LedgerError {
                         code: "transcript_read_failed".into(),
                         stage: "acop.transcript".into(),
                         retryable,
-                        recovery: recovery.into(),
+                        recovery: action.wire().to_owned(),
                     }
                 })
                 .and_then(|observations| {

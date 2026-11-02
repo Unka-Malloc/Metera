@@ -580,8 +580,9 @@ impl UsageJournal {
     /// Batches pull in as needed — peak memory stays one batch — and a
     /// pull or storage failure stops the sequence with every earlier
     /// batch already durable. Refused indexes count across the flattened
-    /// delivery; `events` keeps the leading batch's settlements, since a
-    /// session's full event list is unbounded.
+    /// delivery; `events` keeps at most `MAX_BATCH_OBSERVATIONS`
+    /// settlements, filled from the leading batches — a session's full
+    /// event list is unbounded.
     pub fn publish_all(
         &mut self,
         admission: &SourceAdmission,

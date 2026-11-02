@@ -213,8 +213,9 @@ impl UsageSourceHost {
     /// cadence: every batch commits in its own transaction, so a
     /// mid-sequence failure stops the read with every earlier batch
     /// already durable — never rolled back. Refused indexes count across
-    /// the flattened delivery; `events` keeps only the leading batch's
-    /// settlements since a session's full event list is unbounded.
+    /// the flattened delivery; `events` keeps at most
+    /// `MAX_BATCH_OBSERVATIONS` settlements, filled from the leading
+    /// batches — see [`UsageJournal::publish_all`].
     pub fn publish_all(
         &mut self,
         admission: &SourceAdmission,
