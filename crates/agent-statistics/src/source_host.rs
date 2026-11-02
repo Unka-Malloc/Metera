@@ -224,6 +224,18 @@ impl UsageSourceHost {
         self.journal.publish_all(admission, batches)
     }
 
+    /// Retire one transcript source's unversioned `session#<digits>`
+    /// ids — the one-time cutover a collector runs before its first
+    /// versioned `session#L<line>` settle; see
+    /// [`UsageJournal::retire_transcript_ids`].
+    pub fn retire_transcript_ids(
+        &mut self,
+        source_glob: &str,
+        scope_ref: &str,
+    ) -> LedgerResult<u64> {
+        self.journal.retire_transcript_ids(source_glob, scope_ref)
+    }
+
     /// Settle one observation the host already bound.
     pub fn admit_observation(
         &mut self,

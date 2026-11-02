@@ -528,10 +528,13 @@ impl<'a> TranscriptSource<'a> {
 }
 
 /// A bounded, deterministic observation id: the session's own id plus the
-/// record's position inside it.
+/// record's position inside it. The `#L` marker versions the id scheme —
+/// any earlier shape (`#<ordinal>` without a scheme marker) is legacy:
+/// the collector retires those rows before the first settle so a rescan
+/// under this scheme can never collide with them.
 fn observation_id(session_id: &str, line_index: usize) -> String {
     const LIMIT: usize = token_usage_detector::usage::MAX_OBSERVATION_ID_BYTES;
-    let suffix = format!("#{line_index}");
+    let suffix = format!("#L{line_index}");
     let budget = LIMIT.saturating_sub(suffix.len());
     let end = (0..=budget.min(session_id.len()))
         .rev()
@@ -838,7 +841,7 @@ mod tests {
         let session = "会话-".repeat(LIMIT); // multibyte, far over budget
         let id = observation_id(&session, 12);
         assert!(id.len() <= LIMIT, "{} > {LIMIT}", id.len());
-        assert!(id.ends_with("#12"));
+        assert!(id.ends_with("#L12"));
         // Deterministic and never splits a codepoint.
         assert_eq!(id, observation_id(&session, 12));
         std::str::from_utf8(id.as_bytes()).expect("valid utf-8 by construction");
@@ -954,7 +957,7 @@ mod tests {
             .map(|payload| payload["observationId"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(streamed, expected);
-        assert_eq!(streamed, vec!["parity#1", "parity#3"]);
+        assert_eq!(streamed, vec!["parity#L1", "parity#L3"]);
         assert!(!stats.get().truncated);
         let _ = std::fs::remove_dir_all(&dir);
     }

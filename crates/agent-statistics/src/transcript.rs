@@ -57,6 +57,10 @@ pub struct TranscriptReport {
     /// The session ran past the read's byte ceiling: the settled prefix
     /// is explicitly partial, never silently complete.
     pub truncated: bool,
+    /// Legacy `session#<digits>` ids retired before this settle — the
+    /// one-time cutover clearing pre-marker identities; nonzero once
+    /// per journal, always zero after.
+    pub retired: u64,
 }
 
 /// Collect one session's declared counters into the journal.
@@ -68,7 +72,12 @@ pub struct TranscriptReport {
 /// session never pins the WAL for its whole read. `skipped_lines` and
 /// `truncated` stay visible to the caller: undecodable store lines are
 /// the store's defect, and a session past the byte ceiling settles its
-/// prefix, never a silent "no usage".
+/// prefix, never a silent "no usage". Before the first batch commits,
+/// the source's unversioned `session#<digits>` ids — from any pre-marker
+/// id scheme — are retired in one transaction, so the versioned
+/// `session#L<line>` identities settling here never collide or coexist
+/// with them; the second call finds nothing and the retire count stays
+/// visible on the report.
 pub fn collect_transcript_session(
     host: &mut UsageSourceHost,
     admission: &SourceAdmission,
@@ -121,6 +130,10 @@ pub fn collect_transcript_session(
                     })
                 })
         });
+    let retired = host
+        .retire_transcript_ids("source:acop-transcript#*", scope_ref)
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("transcript session `{}`", entry.session.id))?;
     let ingest = match host.publish_all(admission, batches) {
         Ok(report) => report,
         Err(error) => match read_cause.borrow_mut().take() {
@@ -136,6 +149,7 @@ pub fn collect_transcript_session(
         ingest,
         skipped_lines: stats.skipped_lines,
         truncated: stats.truncated,
+        retired,
     })
 }
 
@@ -235,6 +249,81 @@ mod tests {
         assert_eq!(report.skipped_lines, 0);
         assert!(!report.truncated);
         assert!(report.ingest.refused.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unversioned_ids_are_retired_before_the_versioned_settle() {
+        let dir = std::env::temp_dir().join(format!("metera-transcript-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session_path = dir.join("session-1.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"usage_record\",\"payload\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":4}}}\n",
+        )
+        .unwrap();
+        let entry = SessionEntry {
+            session: SessionRef {
+                id: "session-1".to_owned(),
+                path: session_path,
+                key: None,
+                parent: None,
+            },
+            kind: "synthetic-session-store",
+        };
+        let mut host =
+            UsageSourceHost::open(&json!({"stateRoot": dir.to_string_lossy()})).expect("host");
+        // A journal already holding the pre-marker `session-1#0` — the
+        // upgrade path the cutover exists for.
+        let binding = transcript_binding("synthetic", "pid-test", "epoch-0", &[TRANSCRIPT_SCOPE])
+            .expect("binding");
+        let admission = host.admit_source(
+            binding,
+            crate::journal::SettlementEligibility::SettlementEligible,
+        );
+        let legacy = serde_json::json!({
+            "schema": "licoup.usage-observation.v1",
+            "observationId": "session-1#0",
+            "revision": 1,
+            "sourceEpoch": "epoch-0",
+            "scopeRef": TRANSCRIPT_SCOPE,
+            "observedAt": "2026-11-01T00:00:00Z",
+            "operation": "upsert",
+            "metrics": {
+                "licoup.tokens.input": {"value": "9", "unit": "tokens", "temporality": "delta", "quality": "reported"}
+            },
+        });
+        let seeded = host
+            .publish(&admission, &PublishBatch::new(vec![legacy]).expect("batch"))
+            .expect("legacy settle");
+        assert!(seeded.refused.is_empty(), "{seeded:?}");
+        let binding = transcript_binding("synthetic", "pid-test", "epoch-1", &[TRANSCRIPT_SCOPE])
+            .expect("binding");
+        let admission = host.admit_source(
+            binding,
+            crate::journal::SettlementEligibility::SettlementEligible,
+        );
+        let source = TranscriptSource::of(&StubCodec).expect("spec declared");
+        let report = collect_transcript_session(
+            &mut host,
+            &admission,
+            &source,
+            &entry,
+            TRANSCRIPT_SCOPE,
+            "2026-11-02T00:00:00Z",
+        )
+        .expect("collect");
+        assert_eq!(report.retired, 2, "one fact and one event retired");
+        assert_eq!(report.ingest.accepted, 1);
+        assert!(report.ingest.refused.is_empty());
+        // The total counts only the versioned fact: legacy is gone, not
+        // double-counted beside it.
+        assert_eq!(
+            host.settled_total(TRANSCRIPT_SCOPE, "licoup.tokens.input")
+                .expect("total")
+                .as_deref(),
+            Some("11")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -612,6 +612,45 @@ impl UsageJournal {
         Ok(merged)
     }
 
+    /// Retire one source's unversioned observation ids in a single
+    /// transaction: rows whose id ends `#<digits>` with no scheme marker
+    /// (anything not `#L<line>`) under `source_glob`/`scope_ref` are
+    /// legacy from a pre-marker id scheme — removing them before the
+    /// first versioned settle means old and new identities never
+    /// coexist, so neither a `#0` collision's silent `Superseded` drop
+    /// nor a shifted-range duplicate can happen. Idempotent by
+    /// construction: the second call deletes nothing. Facts and events
+    /// go together — an event row kept without its facts would still
+    /// refuse the versioned replay as `usage_journal_event_conflict`.
+    /// Returns the rows removed, for the collector's report.
+    pub fn retire_transcript_ids(
+        &mut self,
+        source_glob: &str,
+        scope_ref: &str,
+    ) -> LedgerResult<u64> {
+        const LEGACY: &str = "instr(observation_id,'#')>0
+                   AND trim(substr(observation_id,instr(observation_id,'#')+1),'0123456789')=''";
+        let transaction = self
+            .ledger
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| LedgerError::storage())?;
+        let mut removed = 0u64;
+        for table in ["usage_source_facts", "usage_source_events"] {
+            removed += transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE source_ref GLOB ?1
+                         AND scope_ref=?2 AND {LEGACY}"
+                    ),
+                    params![source_glob, scope_ref],
+                )
+                .map_err(|_| LedgerError::storage())? as u64;
+        }
+        transaction.commit().map_err(|_| LedgerError::storage())?;
+        Ok(removed)
+    }
+
     /// The newest written and oldest served fact instants — two index
     /// seeks, not a scan. The max covers every row including retracted
     /// ones (a retraction bumps `updated_at_ms`, so a withdrawal always
@@ -1906,6 +1945,85 @@ mod tests {
 
     fn facts(journal: &UsageJournal) -> Vec<MeteringFact> {
         journal.read(None, 100).expect("readable").facts
+    }
+
+    #[test]
+    fn unversioned_transcript_ids_retire_in_one_pass() {
+        let root = root("retire");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        // A legacy `session#3`, the same session's versioned `#L3`, and
+        // an unrelated source's own `#3` settle first.
+        for (source_ref, observation_id) in [
+            ("source:acop-transcript#synthetic", "s#3"),
+            ("source:acop-transcript#synthetic", "s#L3"),
+            (SOURCE, "s#3"),
+        ] {
+            let binding = SourceBinding::new(
+                source_ref,
+                EXTENSION,
+                "instance-1",
+                1,
+                "epoch-1",
+                ["agent:transcripts"],
+            )
+            .expect("binding");
+            let admission =
+                SourceAdmission::new(binding, SettlementEligibility::SettlementEligible);
+            let mut observation = metric_upsert(observation_id, 1, "1");
+            observation.scope_ref = "agent:transcripts".to_owned();
+            let report = journal
+                .publish(&admission, &batch(&[observation]))
+                .expect("settle");
+            assert!(report.refused.is_empty(), "{report:?}");
+        }
+        let retired = journal
+            .retire_transcript_ids("source:acop-transcript#*", "agent:transcripts")
+            .expect("retire");
+        assert_eq!(retired, 2, "one fact row plus one event row");
+        // Idempotent: the second pass finds nothing.
+        assert_eq!(
+            journal
+                .retire_transcript_ids("source:acop-transcript#*", "agent:transcripts")
+                .expect("second retire"),
+            0
+        );
+        let versioned: i64 = journal
+            .ledger
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_source_facts
+                  WHERE source_ref GLOB 'source:acop-transcript#*'
+                    AND observation_id='s#L3'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(versioned, 1, "the versioned fact survives");
+        // Only the foreign source's `s#3` remains — one row, its own.
+        let remaining: i64 = journal
+            .ledger
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_source_facts
+                  WHERE observation_id='s#3'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(remaining, 1, "the foreign source's row alone survives");
+        let events: i64 = journal
+            .ledger
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_source_events
+                  WHERE source_ref GLOB 'source:acop-transcript#*'
+                    AND observation_id='s#3'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(events, 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
