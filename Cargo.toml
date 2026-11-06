@@ -15,14 +15,15 @@ edition = "2024"
 rust-version = "1.95.0"
 license = "Apache-2.0"
 repository = "https://github.com/Unka-Malloc/Metera"
+readme = "README.md"
 
 [workspace.dependencies]
 acop = { path = "../ACOP/crates/acop", version = "0.2.0" }
 acop-usage-core = { path = "../ACOP/crates/acop-usage-core", version = "0.1.0" }
 metera-sdk = { path = "crates/metera-sdk", version = "0.1.0" }
 acop-usage-source = { path = "crates/acop-usage-source", version = "0.1.0" }
-token-usage-detector = { path = "crates/token-usage-detector", version = "0.2.1" }
-collection-store = { path = "crates/collection-store", version = "0.1.0" }
+token-usage-detector = { path = "crates/token-usage-detector", version = "0.2.2" }
+collection-store = { path = "crates/collection-store", version = "0.1.1" }
 # The flywheel owns the graph-run usage store this crate's journal shares.
 acativa = "0.2.0"
 anyhow = "1"

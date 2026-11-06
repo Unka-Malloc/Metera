@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "Local usage measurement, aggregation and metering journal engine: the usage journal, incremental projection, windowing, attribution, retained-report persistence, source-host composition and request counters."
 
 [dependencies]

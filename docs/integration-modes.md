@@ -11,7 +11,7 @@ usage journal, aggregation and retained reports.
 [dependencies]
 token-usage-detector = "0.2"   # records → bound usage observations
 balance-detector = "0.2"       # provider responses → bound balance facts
-agent-statistics = "0.2"       # usage journal, aggregation and retained reports
+agent-statistics = "0.3"       # usage journal, aggregation and retained reports
 ```
 
 `collection-store` is the storage primitive underneath `agent-statistics`; depend
