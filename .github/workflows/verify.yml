@@ -21,13 +21,21 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: Unka-Malloc/ACOP
+          repository: Unka-Malloc/Agent-Context-Operators
           path: ACOP
           persist-credentials: false
-      # dtolnay/rust-toolchain @stable
+      # dtolnay/rust-toolchain @stable, installing the workspace floor: the
+      # toolchain scripts/build-kernel.sh pins, with the kernel's target.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
-          toolchain: stable
+          toolchain: "1.95.0"
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      # actions/setup-go v7.0.0, at the version sdk/go/go.mod declares.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: Metera/sdk/go/go.mod
+          cache: false
       - run: ./scripts/verify.sh
         working-directory: Metera
 
@@ -43,7 +51,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: Unka-Malloc/ACOP
+          repository: Unka-Malloc/Agent-Context-Operators
           path: ACOP
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
