@@ -1,16 +1,18 @@
-name: verify
+name: Verify
 
 on:
   push:
     branches: [main]
+    tags: ["*-v[0-9]*"]
   pull_request:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       # actions/checkout v4.2.2 — both repositories land side by side so
       # the `../ACOP` Cargo path dependency resolves (see README's
@@ -36,7 +38,14 @@ jobs:
         with:
           go-version-file: Metera/sdk/go/go.mod
           cache: false
-      - run: ./scripts/verify.sh
+      - name: Verify
+        run: ./scripts/verify.sh
+        working-directory: Metera
+      - name: Package the tagged crate
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: cargo package --locked -p "${TAG%-v*}"
         working-directory: Metera
 
   # The detector publishes a lower MSRV than the workspace toolchain: it is
@@ -44,6 +53,8 @@ jobs:
   # floor cannot silently drift up with workspace-only features.
   msrv-detector:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
