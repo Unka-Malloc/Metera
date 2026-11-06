@@ -11,7 +11,7 @@ and the journal engine that measures and keeps them.
 | `agent-statistics` | What does the history say? The usage journal, incremental projection, windowing, attribution, retained-report persistence, request counters and their Prometheus exposition; product knowledge arrives through the `StatisticsHost` port. |
 | `acop-usage-source` | What did an agent spend? Read-only agent-side token counters projected from ACOP transcripts and stores into usage payloads for a `SourceBinding`; the caller supplies epoch and scope. |
 | `metera-sdk` | How does a host run the shared kernel? Rust host SDK that loads the bundled Metera WebAssembly usage kernel and calls its `metera.kernel.v1` store operations. |
-| `metera-wasm` | The WebAssembly usage kernel itself (not published). `scripts/build-kernel.sh` builds it into `crates/metera-sdk/wasm/metera.wasm`; `sdk/go` is the Go host for the same kernel. |
+| `metera-wasm` | The WebAssembly usage kernel itself (not published). `scripts/build-kernel.sh` builds it reproducibly into the tracked `crates/metera-sdk/wasm/metera.wasm`; `sdk/go` is the Go host for the same kernel. |
 
 The detector crates are boundary layers: they open no connections, store no
 ledgers and compute no charges. Provider-specific acquisition lives in
@@ -31,8 +31,10 @@ the host must map them into usage observations and bind them through
 ## Verify
 
 `scripts/verify.sh` — fmt, the kernel build, clippy and tests across the
-workspace, then `go vet` and `go test` for `sdk/go`. The kernel build needs
-the `wasm32-unknown-unknown` Rust target.
+workspace, then `go vet` and `go test` for `sdk/go`. The kernel is built in a
+pinned linux/amd64 Docker image and must match the tracked
+`crates/metera-sdk/wasm/metera.wasm` byte for byte, so verification requires
+Docker (with amd64 emulation on ARM hosts).
 
 The workspace builds against one sibling checkout — a Cargo path
 dependency resolves it at the version `Cargo.toml` declares:

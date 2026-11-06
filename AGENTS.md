@@ -28,4 +28,6 @@ transcript collection) build against one sibling checkout:
 
 ## Verify
 
-`scripts/verify.sh`
+`scripts/verify.sh` — requires Docker (amd64 emulation on ARM hosts): the
+kernel is rebuilt in a pinned container and must match the tracked
+`crates/metera-sdk/wasm/metera.wasm` byte for byte.
