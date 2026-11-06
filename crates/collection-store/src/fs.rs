@@ -222,7 +222,21 @@ pub(crate) fn leaf_regular_len(path: &Path) -> Result<Option<u64>> {
             None => Ok(None),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.file_type().is_file(),
+                    "private state file is not a regular file"
+                );
+                Ok(Some(metadata.len()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("private state boundary could not be established"),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         Err(std::io::Error::new(
@@ -298,7 +312,38 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
         PrivateDir::open(path)?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "private directory {} could not be created",
+                    parent.display()
+                )
+            })?;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => ensure!(
+                metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+                "private state path is not a real directory"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(path).with_context(|| {
+                    format!("private directory {} could not be created", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "private directory {} could not be inspected",
+                        path.display()
+                    )
+                });
+            }
+        }
+        set_private_permissions(path, 0o700)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         fs::create_dir_all(path).with_context(|| {
             format!("private directory {} could not be created", path.display())
@@ -404,6 +449,7 @@ pub fn atomic_write_private_text_bounded(
     }
     #[cfg(not(unix))]
     {
+        let _ = leaf;
         if let Ok(metadata) = fs::symlink_metadata(path) {
             ensure!(
                 metadata.file_type().is_file(),
@@ -501,7 +547,39 @@ pub fn read_private_text_bounded(path: &Path, max_bytes: usize) -> Result<Option
         );
         Ok(Some(text))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "private state file {} could not be inspected",
+                        path.display()
+                    )
+                });
+            }
+        };
+        ensure!(
+            metadata.file_type().is_file(),
+            "private state file is not a regular file"
+        );
+        let file = fs::File::open(path).with_context(|| {
+            format!("private state file {} could not be opened", path.display())
+        })?;
+        let mut text = String::new();
+        file.take(max_bytes as u64 + 1)
+            .read_to_string(&mut text)
+            .with_context(|| format!("private state file {} could not be read", path.display()))?;
+        ensure!(
+            text.len() <= max_bytes,
+            "private state file {} exceeds its bounded size",
+            path.display()
+        );
+        Ok(Some(text))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, max_bytes);
         Err(std::io::Error::new(
@@ -521,7 +599,40 @@ fn sibling_temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{leaf}.tmp-{}-{id}", std::process::id()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_private_permissions(path: &Path, _mode: u32) -> Result<()> {
+    // The owner-only boundary is real on Windows: replace the inherited ACL
+    // with a single Owner Rights grant so the store is neither readable nor
+    // writable by other local users (same descriptor Acativa applies).
+    let ace = if path.is_dir() {
+        "*S-1-3-4:(OI)(CI)(F)"
+    } else {
+        "*S-1-3-4:(F)"
+    };
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", ace])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "owner-only ACL tool could not be started",
+            )
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("owner-only ACL could not be applied to {}", path.display()),
+        ))
+        .context("private state boundary could not be established")
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_private_permissions(path: &Path, _mode: u32) -> Result<()> {
     // A no-op permission call must not stand in for a private boundary: on a
     // shared volume an inherited ACL can leave the store readable or writable

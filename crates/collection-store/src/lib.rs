@@ -636,13 +636,17 @@ mod tests {
 
     #[test]
     fn saved_locator_requires_one_absolute_path() {
+        #[cfg(unix)]
+        let (root, nested, normalized) = ("/data/licoup", "/data/a/../b", "/data/b");
+        #[cfg(windows)]
+        let (root, nested, normalized) = ("C:/data/licoup", "C:/data/a/../b", "C:/data/b");
         assert_eq!(
-            parse_saved_data_home("  /data/licoup \n").unwrap(),
-            PathBuf::from("/data/licoup")
+            parse_saved_data_home(&format!("  {root} \n")).unwrap(),
+            PathBuf::from(root)
         );
         assert_eq!(
-            parse_saved_data_home("/data/a/../b").unwrap(),
-            PathBuf::from("/data/b")
+            parse_saved_data_home(nested).unwrap(),
+            PathBuf::from(normalized)
         );
         for invalid in ["", "  \n", "relative/root", "$HOME/data", "${DIR}/data"] {
             assert!(
