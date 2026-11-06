@@ -1,0 +1,18 @@
+[package]
+name = "metera-wasm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Metera WebAssembly usage kernel"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+acop-usage-core.workspace = true
+metera-sdk = { path = "../metera-sdk", version = "0.1.0", default-features = false }
+serde.workspace = true
+serde_json.workspace = true

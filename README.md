@@ -9,6 +9,9 @@ and the journal engine that measures and keeps them.
 | `balance-detector` | How much remains? Maps provider account responses into bound credit and subscription-quota facts (remaining amounts, weekly/monthly remaining percentages, reset times), with the account bound by the host and provider-specific fetching behind the `BalanceSource` port. |
 | `collection-store` | Where does local state live? Bounded, atomically written JSON collection documents under the portable client-state directory. |
 | `agent-statistics` | What does the history say? The usage journal, incremental projection, windowing, attribution, retained-report persistence, request counters and their Prometheus exposition; product knowledge arrives through the `StatisticsHost` port. |
+| `acop-usage-source` | What did an agent spend? Read-only agent-side token counters projected from ACOP transcripts and stores into usage payloads for a `SourceBinding`; the caller supplies epoch and scope. |
+| `metera-sdk` | How does a host run the shared kernel? Rust host SDK that loads the bundled Metera WebAssembly usage kernel and calls its `metera.kernel.v1` store operations. |
+| `metera-wasm` | The WebAssembly usage kernel itself (not published). `scripts/build-kernel.sh` builds it into `crates/metera-sdk/wasm/metera.wasm`; `sdk/go` is the Go host for the same kernel. |
 
 The detector crates are boundary layers: they open no connections, store no
 ledgers and compute no charges. Provider-specific acquisition lives in
@@ -27,18 +30,20 @@ the host must map them into usage observations and bind them through
 
 ## Verify
 
-`scripts/verify.sh` — fmt + clippy + tests across the workspace.
+`scripts/verify.sh` — fmt, the kernel build, clippy and tests across the
+workspace, then `go vet` and `go test` for `sdk/go`. The kernel build needs
+the `wasm32-unknown-unknown` Rust target.
 
 The workspace builds against one sibling checkout — a Cargo path
 dependency resolves it at the version `Cargo.toml` declares:
 
 | Path | Repository | Provides |
 | --- | --- | --- |
-| `../ACOP` | `Unka-Malloc/ACOP` | `acop` |
+| `../ACOP` | `Unka-Malloc/Agent-Context-Operators` | `acop`, `acop-usage-core` |
 
 Clone it beside this repository before building; a fresh clone without
-it cannot compile `acop-usage-source` or the `agent-statistics`
-transcript collection that depends on it.
+it cannot compile `metera-sdk`, `acop-usage-source` or the
+`agent-statistics` transcript collection that depends on them.
 
 ## License
 

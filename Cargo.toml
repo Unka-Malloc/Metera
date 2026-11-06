@@ -6,6 +6,8 @@ members = [
     "crates/collection-store",
     "crates/balance-detector",
     "crates/token-usage-detector",
+    "crates/metera-sdk",
+    "crates/metera-wasm",
 ]
 
 [workspace.package]
@@ -15,7 +17,9 @@ license = "Apache-2.0"
 repository = "https://github.com/Unka-Malloc/Metera"
 
 [workspace.dependencies]
-acop = { path = "../ACOP/crates/acop", version = "0.1.2" }
+acop = { path = "../ACOP/crates/acop", version = "0.2.0" }
+acop-usage-core = { path = "../ACOP/crates/acop-usage-core", version = "0.1.0" }
+metera-sdk = { path = "crates/metera-sdk", version = "0.1.0" }
 acop-usage-source = { path = "crates/acop-usage-source", version = "0.1.0" }
 token-usage-detector = { path = "crates/token-usage-detector", version = "0.2.1" }
 collection-store = { path = "crates/collection-store", version = "0.1.0" }

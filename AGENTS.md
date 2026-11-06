@@ -19,12 +19,12 @@ accounting lives in the statistics consumer below.
 
 ## Siblings
 
-`acop-usage-source` (and therefore `agent-statistics`' transcript
-collection) builds against one sibling checkout:
+`metera-sdk`, `acop-usage-source` (and therefore `agent-statistics`'
+transcript collection) build against one sibling checkout:
 
 | Path | Repository | Provides |
 | --- | --- | --- |
-| `../ACOP` | `Unka-Malloc/ACOP` | `acop` |
+| `../ACOP` | `Unka-Malloc/Agent-Context-Operators` | `acop`, `acop-usage-core` |
 
 ## Verify
 

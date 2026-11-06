@@ -8,6 +8,11 @@ repository.workspace = true
 description = "Agent-side token counters read through ACOP transcripts, emitted as usage-observation payloads"
 
 [dependencies]
+metera-sdk.workspace = true
 acop.workspace = true
 serde_json.workspace = true
 token-usage-detector.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile = "=3.27.0"

@@ -18,6 +18,8 @@
 //! The adapter is strictly read-only: it opens session files, never writes
 //! to the store, and carries no ledger, no charge and no network surface.
 
+pub mod stored;
+
 use acop::{Codec, SessionEntry, StoreScan, TranscriptUsage, UsageTemporality, store};
 use serde_json::{Value, json};
 use std::io::BufRead;
