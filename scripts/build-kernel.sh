@@ -18,17 +18,13 @@ RUN rustup target add --toolchain 1.95.0 wasm32-unknown-unknown
 EOF
 
 # Crate downloads and build output persist between runs under target/; the
-# Metera checkout and the ACOP path sibling, when present, are read-only.
+# Metera checkout is read-only. Every dependency resolves from crates.io.
 cache=target/kernel-build
 mkdir -p "$cache"
-mounts=(-v "$root:/src/Metera:ro" -v "$root/$cache:/build")
-if [ -d ../ACOP ]; then
-    mounts+=(-v "$(CDPATH= cd -- ../ACOP && pwd):/src/ACOP:ro")
-fi
 sep=$(printf '\037')
-rustflags="--remap-path-prefix=/build/cargo=/_build/cargo${sep}--remap-path-prefix=/src/ACOP=/_build/acop${sep}--remap-path-prefix=/src/Metera=/_build/metera"
+rustflags="--remap-path-prefix=/build/cargo=/_build/cargo${sep}--remap-path-prefix=/src/Metera=/_build/metera"
 docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
-    "${mounts[@]}" --workdir /src/Metera \
+    -v "$root:/src/Metera:ro" -v "$root/$cache:/build" --workdir /src/Metera \
     --env HOME=/build --env CARGO_HOME=/build/cargo --env CARGO_TARGET_DIR=/build/target \
     --env "CARGO_ENCODED_RUSTFLAGS=$rustflags" \
     "$image" \

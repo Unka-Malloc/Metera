@@ -23,12 +23,15 @@ dependencies = [
 [[package]]
 name = "acop"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3849fd57c7091a8698a3b88792b68c977f125ad90a4b14fbded03044424127b2"
 dependencies = [
  "acop-usage-core",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]
@@ -36,6 +39,8 @@ dependencies = [
 [[package]]
 name = "acop-usage-core"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae999cac1f9bde9678fb5d66c15a6281333af9ce090048258c66462d53a861fa"
 dependencies = [
  "serde",
  "serde_json",

@@ -14,17 +14,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      # actions/checkout v4.2.2 — both repositories land side by side so
-      # the `../ACOP` Cargo path dependency resolves (see README's
-      # sibling-checkout table).
+      # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          path: Metera
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: Unka-Malloc/Agent-Context-Operators
-          path: ACOP
           persist-credentials: false
       # dtolnay/rust-toolchain @stable, installing the workspace floor. The
       # kernel itself builds in the pinned Docker image scripts/build-kernel.sh
@@ -36,17 +28,15 @@ jobs:
       # actions/setup-go v7.0.0, at the version sdk/go/go.mod declares.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version-file: Metera/sdk/go/go.mod
+          go-version-file: sdk/go/go.mod
           cache: false
       - name: Verify
         run: ./scripts/verify.sh
-        working-directory: Metera
       - name: Package the tagged crate
         if: startsWith(github.ref, 'refs/tags/')
         env:
           TAG: ${{ github.ref_name }}
         run: cargo package --locked -p "${TAG%-v*}"
-        working-directory: Metera
 
   # The detector publishes a lower MSRV than the workspace toolchain: it is
   # built and tested alone on its declared floor so the embeddable SDK's
@@ -56,17 +46,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          path: Metera
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: Unka-Malloc/Agent-Context-Operators
-          path: ACOP
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: "1.85"
       - run: cargo test -p token-usage-detector --locked
-        working-directory: Metera

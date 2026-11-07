@@ -17,14 +17,12 @@ Both crates are the boundary layer, not clients: no network connections, no
 ledgers, no charges. Provider-specific acquisition lives in adapters above;
 accounting lives in the statistics consumer below.
 
-## Siblings
+## Dependencies
 
 `metera-sdk`, `acop-usage-source` (and therefore `agent-statistics`'
-transcript collection) build against one sibling checkout:
-
-| Path | Repository | Provides |
-| --- | --- | --- |
-| `../ACOP` | `Unka-Malloc/Agent-Context-Operators` | `acop`, `acop-usage-core` |
+transcript collection) depend on `acop` and `acop-usage-core`
+(`Unka-Malloc/Agent-Context-Operators`) as crates.io releases; no sibling
+checkout is needed.
 
 ## Verify
 

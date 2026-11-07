@@ -36,16 +36,9 @@ pinned linux/amd64 Docker image and must match the tracked
 `crates/metera-sdk/wasm/metera.wasm` byte for byte, so verification requires
 Docker (with amd64 emulation on ARM hosts).
 
-The workspace builds against one sibling checkout — a Cargo path
-dependency resolves it at the version `Cargo.toml` declares:
-
-| Path | Repository | Provides |
-| --- | --- | --- |
-| `../ACOP` | `Unka-Malloc/Agent-Context-Operators` | `acop`, `acop-usage-core` |
-
-Clone it beside this repository before building; a fresh clone without
-it cannot compile `metera-sdk`, `acop-usage-source` or the
-`agent-statistics` transcript collection that depends on them.
+Every dependency, including `acop` and `acop-usage-core` from
+[Agent-Context-Operators](https://github.com/Unka-Malloc/Agent-Context-Operators),
+resolves from crates.io; a fresh clone builds on its own.
 
 ## License
 
