@@ -218,14 +218,23 @@ mod tests {
     use crate::registry::TestRegistry;
     use serde_json::json;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// A root no parallel test shares: the clock alone can repeat within one
+    /// tick (microsecond resolution on macOS), and a shared root lets one
+    /// test's cleanup remove the directory another is still writing.
     fn temp_root() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!("lico-agent-usage-persistence-{nonce}"))
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "lico-agent-usage-persistence-{}-{nonce}-{sequence}",
+            std::process::id()
+        ))
     }
 
     fn report(index: usize, agent_id: &str) -> Value {
